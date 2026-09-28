@@ -6,9 +6,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12"}
+        with:
+          python-version: "3.12"
       - run: pip install -r backend/requirements.txt
       - run: python -m compileall -q backend
       - run: python -m unittest discover -s tests -p "test_*.py" -v
         working-directory: backend
-      - run: node --check frontend/app.js
+      - name: Check inline frontend JavaScript
+        shell: python
+        run: |
+          import re, subprocess, pathlib, tempfile
+          html = pathlib.Path("frontend/index.html").read_text(encoding="utf-8")
+          scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", html, re.I | re.S)
+          for i, code in enumerate(scripts):
+              p = pathlib.Path(tempfile.gettempdir()) / f"examsched_script_{i}.js"
+              p.write_text(code, encoding="utf-8")
+              subprocess.run(["node", "--check", str(p)], check=True)

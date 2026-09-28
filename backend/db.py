@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 DB_NAME     = os.getenv("DB_NAME", "TimeTable")
@@ -40,7 +41,7 @@ def format_date_to_standard(raw_date):
     # Try parsing via pandas to_datetime
     try:
         import pandas as pd
-        parsed = pd.to_datetime(raw_str, dayfirst=True, errors='coerce')
+        parsed = pd.to_datetime(raw_str, errors='coerce')
         if not pd.isna(parsed):
             return parsed.strftime("%d-%b-%Y")
     except Exception:
@@ -94,6 +95,15 @@ def migrate_db_schema():
             elif history_changed:
                 update_fields["history"] = new_history
 
+            if "teacher_id" not in f and f.get("email"):
+                update_fields["teacher_id"] = str(f["email"]).split("@")[0]
+            if "email" not in f and f.get("teacher_id"):
+                update_fields["email"] = f"{f['teacher_id']}@pict.edu"
+            if "department" not in f:
+                update_fields["department"] = "General"
+            if "teaching_years" not in f:
+                update_fields["teaching_years"] = []
+
             if update_fields or unset_fields:
                 update_op = {}
                 if update_fields:
@@ -101,28 +111,6 @@ def migrate_db_schema():
                 if unset_fields:
                     update_op["$unset"] = unset_fields
                 faculty_col.update_one({"_id": f["_id"]}, update_op)
-
-        # Teacher schema defaults. Teaching eligibility is intentionally NOT
-        # inferred from the exam workbook. Existing records without an explicit
-        # teaching_years value are initialized as an empty list and must be
-        # configured by the coordinator before they can receive duties.
-        for f in faculty_col.find():
-            set_fields = {}
-            if "teacher_id" not in f and f.get("email"):
-                set_fields["teacher_id"] = str(f["email"]).split("@")[0]
-            if "email" not in f and f.get("teacher_id"):
-                set_fields["email"] = f"{f['teacher_id']}@pict.edu"
-            if "department" not in f:
-                set_fields["department"] = "General"
-            if "teaching_years" not in f:
-                set_fields["teaching_years"] = []
-            if "duty_counts" not in f:
-                set_fields["duty_counts"] = {"squad": 0, "junior": 0, "senior": 0}
-            if "has_served_high_role" not in f: set_fields["has_served_high_role"] = False
-            if "last_role" not in f: set_fields["last_role"] = "N/A"
-            if "history" not in f: set_fields["history"] = []
-            if set_fields:
-                faculty_col.update_one({"_id": f["_id"]}, {"$set": set_fields})
 
         # Normalize adjustments dates to %d-%b-%Y
         adjustments_col = database["adjustments"]
@@ -160,9 +148,9 @@ def get_db():
             migrate_db_schema()
             new_db["teachers"].create_index("teacher_id", unique=True, sparse=True)
             new_db["teachers"].create_index("email", unique=True, sparse=True)
-            new_db["adjustments"].create_index([("status",1),("created_at",-1)])
-            new_db["timetables"].create_index([("department",1),("version",-1)])
-            new_db["timetables"].create_index([("confirmed_at",-1)])
+            new_db["adjustments"].create_index([("status", 1), ("created_at", -1)])
+            new_db["timetables"].create_index([("department", 1), ("version", -1)])
+            new_db["timetables"].create_index([("confirmed_at", -1)])
         except Exception:
             client = None
             db = None
@@ -213,11 +201,11 @@ def init_faculty(teachers_data):
                 "teacher_id": t_id,
                 "name"      : t_info["name"],
                 "role"      : t_info.get("role", existing.get("role", "Junior")),
-                "department": existing.get("department", "General"),
             }
             if "duty_counts" not in existing:
                 flat_count = existing.get("duty_count", 0)
-                role_key = update_fields["role"].lower() if update_fields["role"].lower() in ["junior", "senior", "squad"] else "junior"
+                role_val = str(update_fields.get("role") or "junior").strip().lower()
+                role_key = role_val if role_val in ["junior", "senior", "squad"] else "junior"
                 update_fields["duty_counts"] = {
                     "squad": flat_count if role_key == "squad" else 0,
                     "junior": flat_count if role_key == "junior" else 0,
@@ -232,12 +220,12 @@ def init_faculty(teachers_data):
 
 
 def set_teacher_eligibility(teacher_id, teaching_years, department=None):
-    """Coordinator-only data operation for the authoritative teacher eligibility."""
+    """Coordinator-only update for MongoDB teacher eligibility."""
     database = get_db()
     normalized = []
+    aliases = {"1": "FY", "2": "SY", "3": "TY", "4": "BTECH", "B.TECH": "BTECH"}
     for value in teaching_years or []:
         v = str(value).strip().upper().replace(" ", "")
-        aliases = {"1":"FY","2":"SY","3":"TY","4":"BTECH","B.TECH":"BTECH"}
         v = aliases.get(v, v)
         if v in {"FY", "SY", "TY", "BTECH", "ALL"} and v not in normalized:
             normalized.append(v)
@@ -264,7 +252,8 @@ def update_faculty_duty(teacher_id, role, date, slot_id, is_high_role=False, cou
     """
     database    = get_db()
     date = format_date_to_standard(date)
-    role_key = role.lower() if role.lower() in ["junior", "senior", "squad"] else "junior"
+    role_val = str(role or "junior").strip().lower()
+    role_key = role_val if role_val in ["junior", "senior", "squad"] else "junior"
     
     # Sensible defaults for room based on role if not provided
     if not room_assigned:
@@ -295,10 +284,18 @@ def update_faculty_duty(teacher_id, role, date, slot_id, is_high_role=False, cou
     if is_high_role:
         update_data["$set"]["has_served_high_role"] = True
 
-    # Try the new field first, fall back to email for legacy docs
-    result = database["teachers"].update_one({"teacher_id": teacher_id}, update_data)
-    if result.matched_count == 0:
-        database["teachers"].update_one({"email": teacher_id}, update_data)
+    # Query by teacher_id, numeric formats, and email
+    query_filters = [
+        {"teacher_id": str(teacher_id)},
+        {"teacher_id": str(teacher_id).upper()},
+        {"email": str(teacher_id).lower()},
+        {"email": f"{teacher_id}@pict.edu".lower()}
+    ]
+    if str(teacher_id).isdigit():
+        query_filters.append({"teacher_id": f"{int(teacher_id):03d}"})
+        query_filters.append({"teacher_id": str(int(teacher_id))})
+
+    database["teachers"].update_one({"$or": query_filters}, update_data)
 
 
 def check_reset_fairness(department="IT"):
@@ -354,6 +351,172 @@ def update_password(identifier: str, new_password: str) -> bool:
         {"$set": {"password_hash": new_hash}}
     )
     return result.matched_count > 0
+
+
+def ensure_coordinator():
+    """
+    Create the coordinator account from environment variables if it does not
+    already exist. Existing coordinator passwords are not overwritten on every
+    server restart.
+    """
+    coordinator_email = (os.getenv("COORDINATOR_EMAIL") or "").strip().lower()
+    coordinator_password = os.getenv("COORDINATOR_PASSWORD") or ""
+
+    if not coordinator_email or not coordinator_password:
+        return False
+
+    database = get_db()
+    teachers = database["teachers"]
+    existing = teachers.find_one({"email": coordinator_email})
+
+    if existing:
+        update = {"is_admin": True}
+        if not existing.get("role"):
+            update["role"] = "Coordinator"
+        teachers.update_one({"_id": existing["_id"]}, {"$set": update})
+        return True
+
+    teacher_id = coordinator_email.split("@")[0].upper()
+    teachers.insert_one({
+        "teacher_id": teacher_id,
+        "email": coordinator_email,
+        "name": os.getenv("COORDINATOR_NAME", "Examination Coordinator"),
+        "role": "Coordinator",
+        "department": os.getenv("COORDINATOR_DEPARTMENT", "IT"),
+        "is_admin": True,
+        "has_served_high_role": True,
+        "duty_counts": {"squad": 0, "junior": 0, "senior": 0},
+        "last_role": "N/A",
+        "history": [],
+        "password_hash": generate_password_hash(coordinator_password),
+        "password_changed": True,
+    })
+    return True
+
+
+def get_all_teachers_from_db():
+    """
+    Fetch all active faculty records from MongoDB formatted for the scheduling pipeline.
+    """
+    database = get_db()
+    teachers = {}
+    for doc in database["teachers"].find({"is_admin": {"$ne": True}}):
+        t_id = doc.get("teacher_id") or doc.get("email", "").split("@")[0].upper()
+        raw_prefs = doc.get("preferred_slots") or []
+        preferred_slots = set()
+        if isinstance(raw_prefs, (list, set)):
+            for p in raw_prefs:
+                try:
+                    preferred_slots.add(int(p))
+                except (ValueError, TypeError):
+                    preferred_slots.add(str(p))
+        elif isinstance(raw_prefs, str):
+            for p in raw_prefs.split(","):
+                p_str = p.strip()
+                if p_str:
+                    try:
+                        preferred_slots.add(int(p_str))
+                    except ValueError:
+                        preferred_slots.add(p_str)
+
+        teachers[t_id] = {
+            "id": t_id,
+            "name": doc.get("name", f"Prof. {t_id}"),
+            "role": doc.get("role", "Junior"),
+            "department": doc.get("department", "General"),
+            "preferred_slots": preferred_slots
+        }
+    return teachers
+
+
+def update_confirmed_timetable_swap(action_type, requester_id, current_date, current_slot, new_date, new_slot, swap_teacher_id=None, target_course="ALL", target_room="TBD", target_session="TBD"):
+    """
+    Atomically update the published/confirmed timetable document in MongoDB
+    so that duty swaps/moves immediately reflect in both Coordinator view and downloads.
+    """
+    database = get_db()
+    timetable_doc = database["timetables"].find_one({"cleared": {"$ne": True}}, sort=[("confirmed_at", -1)])
+    if not timetable_doc:
+        return False
+
+    teacher_duties = timetable_doc.get("teacher_duties", [])
+    req_doc = database["teachers"].find_one({"$or": [{"teacher_id": requester_id}, {"email": requester_id}]})
+    req_id_str = req_doc.get("teacher_id", requester_id) if req_doc else requester_id
+    req_name = req_doc.get("name", "Unknown") if req_doc else "Unknown"
+
+    cur_date_norm = format_date_to_standard(current_date)
+    new_date_norm = format_date_to_standard(new_date)
+    cur_slot_str = str(current_slot)
+    new_slot_str = str(new_slot)
+
+    updated = False
+
+    if action_type == "swap" and swap_teacher_id:
+        partner_doc = database["teachers"].find_one({"$or": [{"teacher_id": swap_teacher_id}, {"email": swap_teacher_id}]})
+        partner_id_str = partner_doc.get("teacher_id", swap_teacher_id) if partner_doc else swap_teacher_id
+        partner_name = partner_doc.get("name", "Unknown") if partner_doc else "Unknown"
+
+        idx1 = None
+        idx2 = None
+
+        for idx, d in enumerate(teacher_duties):
+            d_id = str(d.get("teacher_id"))
+            d_date = format_date_to_standard(d.get("date"))
+            d_slot = str(d.get("slot"))
+
+            if (d_id == req_id_str or d_id == requester_id) and d_date == cur_date_norm and d_slot == cur_slot_str:
+                if idx1 is None:
+                    idx1 = idx
+
+            if (d_id == partner_id_str or d_id == swap_teacher_id) and d_date == new_date_norm and d_slot == new_slot_str:
+                if idx2 is None:
+                    idx2 = idx
+
+        if idx1 is not None and idx2 is not None:
+            # Swap faculty details in the active duties list
+            teacher_duties[idx1]["teacher_id"] = partner_id_str
+            teacher_duties[idx1]["teacher_name"] = partner_name
+            teacher_duties[idx1]["last_role"] = partner_doc.get("last_role", "N/A") if partner_doc else "N/A"
+
+            teacher_duties[idx2]["teacher_id"] = req_id_str
+            teacher_duties[idx2]["teacher_name"] = req_name
+            teacher_duties[idx2]["last_role"] = req_doc.get("last_role", "N/A") if req_doc else "N/A"
+            updated = True
+        elif idx1 is not None:
+            # If partner's slot wasn't found in duties, update requester's slot with partner
+            teacher_duties[idx1]["teacher_id"] = partner_id_str
+            teacher_duties[idx1]["teacher_name"] = partner_name
+            updated = True
+
+    elif action_type == "move":
+        for idx, d in enumerate(teacher_duties):
+            d_id = str(d.get("teacher_id"))
+            d_date = format_date_to_standard(d.get("date"))
+            d_slot = str(d.get("slot"))
+
+            if (d_id == req_id_str or d_id == requester_id) and d_date == cur_date_norm and d_slot == cur_slot_str:
+                teacher_duties[idx]["date"] = new_date_norm
+                teacher_duties[idx]["slot"] = int(new_slot) if str(new_slot).isdigit() else new_slot
+                if target_session and target_session != "TBD":
+                    teacher_duties[idx]["session"] = target_session
+                if target_course and target_course != "ALL":
+                    teacher_duties[idx]["course_id"] = target_course
+                if target_room and target_room != "TBD":
+                    teacher_duties[idx]["room_assigned"] = target_room
+                updated = True
+                break
+
+    if updated:
+        database["timetables"].update_one(
+            {"_id": timetable_doc["_id"]},
+            {"$set": {
+                "teacher_duties": teacher_duties,
+                "last_modified_at": datetime.utcnow().isoformat() + "Z"
+            }}
+        )
+
+    return updated
+
 
 
 if __name__ == "__main__":

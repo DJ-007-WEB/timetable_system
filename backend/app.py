@@ -3,6 +3,7 @@ from flask_cors import CORS
 import os
 import io
 import re
+import hmac
 from datetime import date, timedelta, datetime
 import pdfplumber
 from PyPDF2 import PdfReader
@@ -15,6 +16,7 @@ from main import (
     allocate_rooms,
     load_room_data,
     build_duties,
+    validate_schedule,
     assign_teachers,
     load_teacher_data
 )
@@ -25,6 +27,8 @@ from db import (
     get_db,
     update_faculty_duty,
     check_reset_fairness,
+    ensure_coordinator,
+    update_confirmed_timetable_swap,
     set_teacher_eligibility
 )
 from flask import send_file
@@ -34,38 +38,51 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from werkzeug.utils import secure_filename
 import uuid
-import os
+from functools import wraps
+from dotenv import load_dotenv
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 app = Flask(
     __name__,
     static_folder=os.path.join("..", "frontend"),
 )
-ALLOWED_ORIGIN=os.getenv("FRONTEND_ORIGIN", "").strip()
+
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY")
+if not app.config["SECRET_KEY"]:
+    raise RuntimeError("SECRET_KEY is missing. Create backend/.env before starting Flask.")
+app.config["UPLOAD_FOLDER"] = os.path.join(BASE_DIR, "uploads")
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10")) * 1024 * 1024
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+
+ALLOWED_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip()
 if ALLOWED_ORIGIN:
     CORS(app, origins=[ALLOWED_ORIGIN], supports_credentials=True)
-app.secret_key=os.getenv("FLASK_SECRET_KEY") or os.urandom(32)
-app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE=os.getenv("SESSION_COOKIE_SAMESITE","Lax"),SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE","0")=="1",MAX_CONTENT_LENGTH=int(os.getenv("MAX_UPLOAD_MB","10"))*1024*1024)
 
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+UPLOAD_FOLDER = app.config["UPLOAD_FOLDER"]
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
+PUBLIC_PATHS = {"/", "/index.css", "/login", "/signup", "/session", "/logout", "/csrf-token"}
 
-from functools import wraps
-def require_login(fn):
-    @wraps(fn)
-    def wrapper(*args,**kwargs):
-        if not session.get("authenticated"): return jsonify({"error":"Authentication required"}),401
-        return fn(*args,**kwargs)
-    return wrapper
-def require_admin(fn):
-    @wraps(fn)
-    def wrapper(*args,**kwargs):
-        if not session.get("authenticated"): return jsonify({"error":"Authentication required"}),401
-        if not session.get("is_admin"): return jsonify({"error":"Coordinator access required"}),403
-        return fn(*args,**kwargs)
-    return wrapper
-def current_teacher_id(): return session.get("teacher_id")
+COORDINATOR_PATHS = {
+    "/generate",
+    "/export_excel",
+    "/confirm",
+    "/clear_confirmed_timetable",
+    "/adjustments",
+    "/adjustments/alternatives",
+    "/approve_adjustment",
+    "/reject_adjustment",
+    "/admin/teachers",
+    "/timetable/versions",
+    "/timetable/rollback",
+}
+
+TEACHER_PATHS = {"/request_adjustment"}
+
 
 def _csrf_token():
     token = session.get("csrf_token")
@@ -74,12 +91,22 @@ def _csrf_token():
         session["csrf_token"] = token
     return token
 
+def require_admin(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            return jsonify({"error": "Authentication required"}), 401
+        if not session.get("is_admin"):
+            return jsonify({"error": "Coordinator access required"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
 def require_csrf(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         expected = session.get("csrf_token")
         supplied = request.headers.get("X-CSRF-Token", "")
-        if not expected or not supplied or not __import__('hmac').compare_digest(expected, supplied):
+        if not expected or not supplied or not hmac.compare_digest(expected, supplied):
             return jsonify({"error": "Invalid CSRF token"}), 403
         return fn(*args, **kwargs)
     return wrapper
@@ -93,14 +120,56 @@ def handle_unexpected_error(exc):
     app.logger.exception("Unhandled application error")
     return jsonify({"error": "Internal server error"}), 500
 
-# ================================================
-# ROUTES
+@app.route("/csrf-token", methods=["GET"])
+def csrf_token():
+    return jsonify({"csrf_token": _csrf_token()})
+
+@app.before_request
+def require_authentication():
+    # Bootstrap the coordinator account once, using backend/.env.
+    if not app.config.get("COORDINATOR_BOOTSTRAPPED"):
+        try:
+            ensure_coordinator()
+            app.config["COORDINATOR_BOOTSTRAPPED"] = True
+        except Exception as exc:
+            app.logger.warning("Coordinator bootstrap skipped: %s", exc)
+
+    path = request.path
+
+    if path in PUBLIC_PATHS or path.startswith("/static/") or path.startswith("/download_sample/"):
+        return None
+
+    if path.startswith("/uploads/"):
+        if not session.get("user_id"):
+            return jsonify({"error": "Authentication required"}), 401
+        return None
+
+    protected_common = {"/change_password", "/confirmed_timetable", "/teacher/status", "/download_confirmed_excel"}
+
+    if path not in COORDINATOR_PATHS and path not in TEACHER_PATHS and path not in protected_common:
+        return None
+
+    if not session.get("user_id"):
+        return jsonify({"error": "Authentication required"}), 401
+
+    is_admin = bool(session.get("is_admin"))
+
+    if path in COORDINATOR_PATHS and not is_admin:
+        return jsonify({"error": "Coordinator access required"}), 403
+
+    if path in TEACHER_PATHS and is_admin:
+        return jsonify({"error": "Faculty access required"}), 403
+
+    return None
+
+
 @app.route("/uploads/<filename>")
-@require_login
 def serve_upload(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
+# ================================================
+# ROUTES
 # ================================================
 
 @app.route("/")
@@ -111,160 +180,290 @@ def index():
 def css():
     return send_from_directory(app.static_folder, "index.css")
 
-@app.route("/csrf-token", methods=["GET"])
-def csrf_token():
-    return jsonify({"csrf_token": _csrf_token()})
-
 
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.get_json()
+    data = request.get_json() or {}
+    identifier = (data.get("email") or data.get("identifier") or "").strip()
+    password = (data.get("password") or "").strip()
 
-    email    = data.get("email", "").strip()    if data else ""
-    password = data.get("password", "").strip() if data else ""
-
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
+    if not identifier:
+        return jsonify({"error": "Institutional email or Teacher ID is required"}), 400
     if not password:
         return jsonify({"error": "Password is required"}), 400
 
     try:
-        from db import get_db, check_password_hash
         database = get_db()
-
         user = database["teachers"].find_one({
             "$or": [
-                {"email": email},
-                {"teacher_id": email}
+                {"email": identifier.lower()},
+                {"email": identifier},
+                {"teacher_id": identifier},
+                {"teacher_id": identifier.upper()},
+                {"teacher_id": identifier.lower()},
             ]
         })
 
         if user is None:
+            return jsonify({"error": "Invalid credentials. If you are a new faculty member, please sign up."}), 401
+
+        user_email = (user.get("email") or f"{user.get('teacher_id')}@pict.edu").strip().lower()
+        if not user_email.endswith("@pict.edu") and not user.get("is_admin"):
+            return jsonify({"error": "Only @pict.edu institutional accounts are allowed"}), 403
+
+        stored_hash = user.get("password_hash")
+        teacher_id = user.get("teacher_id", user_email.split("@")[0])
+
+        if stored_hash:
+            from db import check_password_hash
+            valid = check_password_hash(stored_hash, password)
+        else:
+            return jsonify({"error": "Account password is not initialized. Ask the coordinator to run the user migration."}), 403
+
+        if not valid:
             return jsonify({"error": "Invalid credentials"}), 401
 
-        # --- @pict.edu domain check ---
-        if not email.lower().endswith("@pict.edu"):
-            return jsonify({"error": "Only @pict.edu email addresses are allowed"}), 403
+        session.clear()
+        session["user_id"] = teacher_id
+        session["identifier"] = user_email
+        session["authenticated"] = True
+        session["teacher_id"] = teacher_id
+        session["email"] = user_email
+        session["is_admin"] = bool(user.get("is_admin", False))
 
-        # --- Password check ---
-        stored_hash = user.get("password_hash")
-        teacher_id  = user.get("teacher_id", user.get("email", "").split("@")[0])
-
-        if stored_hash:
-            # Normal path: validate against stored hash
-            if not check_password_hash(stored_hash, password):
-                return jsonify({"error": "Invalid credentials"}), 401
-        else:
-            return jsonify({"error":"Account password is not initialized. Ask the coordinator to run the user migration."}),403
-
-        user_email = user.get("email", f"{teacher_id}@pict.edu")
-        session.clear(); session["authenticated"]=True; session["teacher_id"]=teacher_id; session["email"]=user_email; session["is_admin"]=bool(user.get("is_admin",False))
         return jsonify({
-            "name"      : user.get("name"),
-            "role"      : user.get("role"),
-            "is_admin"  : user.get("is_admin", False),
-            "history"   : user.get("history", []),
-            "identifier": user_email
+            "name": user.get("name", f"Prof. {teacher_id}"),
+            "role": user.get("role", "Junior"),
+            "department": user.get("department", "General"),
+            "is_admin": bool(user.get("is_admin", False)),
+            "history": user.get("history", []),
+            "identifier": user_email,
+            "teacher_id": teacher_id,
         })
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return safe_server_error()
-        
 
-@app.route("/change_password", methods=["POST"])
-@require_csrf
-def change_password():
-    data             = request.get_json()
-    identifier       = (data.get("identifier", "") or "").strip()
-    current_password = (data.get("current_password", "") or "").strip()
-    new_password     = (data.get("new_password", "") or "").strip()
 
-    if not identifier or not current_password or not new_password:
+@app.route("/signup", methods=["POST"])
+def signup():
+    """Register or activate a faculty record with a user-selected password."""
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+    confirm_password = (data.get("confirm_password") or "").strip()
+    name = (data.get("name") or "").strip()
+    department = (data.get("department") or "IT").strip()
+
+    if not email or not password or not confirm_password:
         return jsonify({"error": "All fields are required"}), 400
-    if len(new_password)<8 or not re.search(r"[A-Z]",new_password) or not re.search(r"[a-z]",new_password) or not re.search(r"\d",new_password) or not re.search(r"[^A-Za-z0-9]",new_password):
-        return jsonify({"error":"Password must be at least 8 characters and include upper, lower, digit and special character"}),400
+
+    if not email.endswith("@pict.edu"):
+        return jsonify({"error": "Please use your @pict.edu institutional email"}), 400
+
+    if password != confirm_password:
+        return jsonify({"error": "Passwords do not match"}), 400
+
+    if len(password) < 8 or not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password) or not re.search(r"[^A-Za-z0-9]", password):
+        return jsonify({"error": "Password must be at least 8 characters and include upper, lower, digit and special character"}), 400
+
+    teacher_id = email.split("@")[0].strip()
 
     try:
-        if not session.get("authenticated"): return jsonify({"error":"Authentication required"}),401
-        if identifier not in {session.get("teacher_id"),session.get("email")} and not session.get("is_admin"): return jsonify({"error":"You can only change your own password"}),403
-        from db import get_db, check_password_hash, update_password
+        from db import generate_password_hash
         database = get_db()
+        teachers = database["teachers"]
 
-        user = database["teachers"].find_one({
-            "$or": [{"email": identifier}, {"teacher_id": identifier}]
+        user = teachers.find_one({
+            "$or": [
+                {"teacher_id": teacher_id},
+                {"teacher_id": teacher_id.upper()},
+                {"email": email}
+            ]
         })
+
         if user is None:
-            return jsonify({"error": "User not found"}), 404
+            # Create a new faculty member account
+            display_name = name or f"Prof. {teacher_id.capitalize()}"
+            new_doc = {
+                "teacher_id": teacher_id,
+                "email": email,
+                "name": display_name,
+                "role": "Junior",
+                "department": department,
+                "preferred_slots": [],
+                "teaching_years": [],
+                "has_served_high_role": False,
+                "duty_counts": {"squad": 0, "junior": 0, "senior": 0},
+                "last_role": "N/A",
+                "history": [],
+                "password_hash": generate_password_hash(password),
+                "password_changed": True,
+                "is_admin": False
+            }
+            teachers.insert_one(new_doc)
+            return jsonify({
+                "success": True,
+                "message": "Faculty account created successfully! You can now log in."
+            })
 
-        stored_hash = user.get("password_hash")
-        teacher_id  = user.get("teacher_id", user.get("email", "").split("@")[0])
+        if user.get("is_admin", False):
+            return jsonify({
+                "error": "Coordinator accounts cannot be modified through faculty signup."
+            }), 403
 
-        # Validate current password (same logic as login)
-        if stored_hash:
-            if not check_password_hash(stored_hash, current_password):
-                return jsonify({"error": "Current password is incorrect"}), 401
-        else:
-            return jsonify({"error":"Account password is not initialized. Ask the coordinator to run the user migration."}),403
+        # Update existing faculty record
+        teachers.update_one(
+            {"_id": user["_id"]},
+            {"$set": {
+                "email": email,
+                "password_hash": generate_password_hash(password),
+                "password_changed": True
+            }}
+        )
 
-        ok = update_password(identifier, new_password)
-        if ok:
-            return jsonify({"success": True})
-        else:
-            return jsonify({"error": "Failed to update password"}), 500
+        return jsonify({
+            "success": True,
+            "message": "Faculty account activated successfully! You can now log in."
+        })
 
+    except Exception:
+        return safe_server_error()
+
+
+@app.route("/seed_test_data", methods=["POST"])
+@require_csrf
+@require_admin
+def seed_test_data():
+    """Endpoint to seed test teachers 001-010 on demand."""
+    try:
+        from seed_teachers import seed
+        seed()
+        return jsonify({"success": True, "message": "Test teachers 001 to 010 seeded successfully."})
+    except Exception:
+        return safe_server_error()
+
+
+@app.route("/session", methods=["GET"])
+def get_session():
+    if not session.get("user_id"):
+        return jsonify({"authenticated": False})
+
+    try:
+        database = get_db()
+        user = database["teachers"].find_one({
+            "teacher_id": session.get("user_id")
+        })
+
+        if not user:
+            session.clear()
+            return jsonify({"authenticated": False})
+
+        return jsonify({
+            "authenticated": True,
+            "name": user.get("name"),
+            "role": user.get("role"),
+            "is_admin": bool(user.get("is_admin", False)),
+            "history": user.get("history", []),
+            "identifier": user.get("email"),
+            "teacher_id": user.get("teacher_id")
+        })
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return safe_server_error()
 
 
 @app.route("/logout", methods=["POST"])
 @require_csrf
 def logout():
-    session.clear(); return jsonify({"success":True})
+    session.clear()
+    return jsonify({"success": True})
 
-@app.route("/health")
-def health():
-    try: get_db().command("ping"); return jsonify({"status":"ok","database":"ok"})
-    except Exception: return jsonify({"status":"degraded","database":"unavailable"}),503
 
-@app.route("/admin/teachers", methods=["GET", "PUT"])
-@require_login
-def admin_teachers():
-    if not session.get("is_admin"):
-        return jsonify({"error": "Coordinator access required"}), 403
+@app.route("/change_password", methods=["POST"])
+@require_csrf
+def change_password():
+    data = request.get_json() or {}
+    current_password = (data.get("current_password") or "").strip()
+    new_password = (data.get("new_password") or "").strip()
+
+    if not current_password or not new_password:
+        return jsonify({"error": "All fields are required"}), 400
+
+    if len(new_password) < 8 or not re.search(r"[A-Z]", new_password) or not re.search(r"[a-z]", new_password) or not re.search(r"\d", new_password) or not re.search(r"[^A-Za-z0-9]", new_password):
+        return jsonify({"error": "Password must be at least 8 characters and include upper, lower, digit and special character"}), 400
+
+    identifier = session.get("identifier")
+    if not session.get("authenticated") or not identifier:
+        return jsonify({"error": "Authentication required"}), 401
+    if identifier not in {session.get("identifier"), session.get("teacher_id"), session.get("email")} and not session.get("is_admin"):
+        return jsonify({"error": "You can only change your own password"}), 403
+
     try:
-        if request.method == "PUT":
-            expected = session.get("csrf_token")
-            supplied = request.headers.get("X-CSRF-Token", "")
-            if not expected or not supplied or not __import__('hmac').compare_digest(expected, supplied):
-                return jsonify({"error": "Invalid CSRF token"}), 403
         database = get_db()
-        if request.method == "GET":
-            docs = []
-            for t in database["teachers"].find({}, {"_id": 0, "password_hash": 0}):
-                docs.append(t)
-            return jsonify({"teachers": docs})
-        data = request.get_json() or {}
-        teacher_id = str(data.get("teacher_id", "")).strip()
-        years = data.get("teaching_years", [])
-        department = data.get("department")
-        if not teacher_id:
-            return jsonify({"error": "teacher_id is required"}), 400
-        if not set_teacher_eligibility(teacher_id, years, department):
-            return jsonify({"error": "Teacher not found"}), 404
-        return jsonify({"success": True, "teacher_id": teacher_id, "teaching_years": years})
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    except Exception:
+        user = database["teachers"].find_one({
+            "$or": [
+                {"email": identifier},
+                {"teacher_id": session.get("user_id")}
+            ]
+        })
+
+        if user is None:
+            return jsonify({"error": "User not found"}), 404
+
+        stored_hash = user.get("password_hash")
+        teacher_id = user.get("teacher_id")
+
+        if stored_hash:
+            from db import check_password_hash
+            valid = check_password_hash(stored_hash, current_password)
+        else:
+            return jsonify({"error": "Account password is not initialized. Ask the coordinator to run the user migration."}), 403
+
+        if not valid:
+            return jsonify({"error": "Current password is incorrect"}), 401
+
+        from db import update_password
+        if not update_password(identifier, new_password):
+            return jsonify({"error": "Failed to update password"}), 500
+
+        database["teachers"].update_one(
+            {"_id": user["_id"]},
+            {"$set": {"password_changed": True}}
+        )
+
+        return jsonify({"success": True})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return safe_server_error()
 
 
+@app.route("/admin/teachers", methods=["GET", "PUT"])
+@require_admin
+def admin_teachers():
+    if request.method == "GET":
+        docs = list(get_db()["teachers"].find({}, {"_id": 0, "password_hash": 0}))
+        return jsonify({"teachers": docs})
+    expected = session.get("csrf_token")
+    supplied = request.headers.get("X-CSRF-Token", "")
+    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        return jsonify({"error": "Invalid CSRF token"}), 403
+    data = request.get_json() or {}
+    teacher_id = str(data.get("teacher_id", "")).strip()
+    years = data.get("teaching_years", [])
+    if not teacher_id:
+        return jsonify({"error": "teacher_id is required"}), 400
+    try:
+        ok = set_teacher_eligibility(teacher_id, years, data.get("department"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not ok:
+        return jsonify({"error": "Teacher not found"}), 404
+    return jsonify({"success": True, "teacher_id": teacher_id, "teaching_years": years})
+
 @app.route("/generate", methods=["POST"])
 @require_csrf
-@require_admin
 def generate():
     """
     Main pipeline: Filter -> DSATUR -> Rooms -> Teachers
@@ -295,32 +494,35 @@ def generate():
         return jsonify({"error": "No file uploaded"}), 400
     
     file = request.files["file"]
-    if file.filename == "": return jsonify({"error":"No file selected"}),400
-    if not file.filename.lower().endswith(".xlsx"):
-        return jsonify({"error":"Only .xlsx workbooks are accepted"}),400
-    if file.mimetype not in {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream"}:
-        return jsonify({"error":"Invalid workbook content type"}),400
-    file_content=file.read()
-    temp_path=os.path.join(app.config["UPLOAD_FOLDER"],f"generation_{uuid.uuid4().hex}.xlsx")
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    file_content = file.read()
+    temp_path = "temp_data.xlsx"
     with open(temp_path, "wb") as f:
         f.write(file_content)
+
+    # Optional separate teacher preferences file (CSV or Excel)
+    temp_pref_path = None
+    if "preferences_file" in request.files:
+        pref_file = request.files["preferences_file"]
+        if pref_file and pref_file.filename != "":
+            ext = ".csv" if pref_file.filename.lower().endswith(".csv") else ".xlsx"
+            temp_pref_path = f"temp_preferences{ext}"
+            with open(temp_pref_path, "wb") as pf:
+                pf.write(pref_file.read())
 
     # -----------------------------------------------
     # 1b. Validate required Excel sheets are present
     # -----------------------------------------------
-    REQUIRED_SHEETS = ["Student_Courses", "Courses", "Rooms", "Teachers"]
     try:
-        import openpyxl as _openpyxl
-        _wb = _openpyxl.load_workbook(temp_path, read_only=True)
-        missing = [s for s in REQUIRED_SHEETS if s not in _wb.sheetnames]
-        _wb.close()
-        if missing:
-            return jsonify({
-                "error": (
-                    f"Missing required sheet(s) in uploaded Excel: {', '.join(missing)}. "
-                    f"Expected sheets: {', '.join(REQUIRED_SHEETS)}."
-                )
-            }), 400
+        from main import find_sheet
+        if not find_sheet(temp_path, ["Student_Courses", "StudentCourses", "Students", "Enrollments"]):
+            return jsonify({"error": "Missing required 'Student_Courses' sheet in uploaded Excel."}), 400
+        if not find_sheet(temp_path, ["Courses", "Course", "Subjects", "Course_Details"]):
+            return jsonify({"error": "Missing required 'Courses' sheet in uploaded Excel."}), 400
+        if not find_sheet(temp_path, ["Rooms", "Room", "Classrooms", "Halls"]):
+            return jsonify({"error": "Missing required 'Rooms' sheet in uploaded Excel."}), 400
     except Exception as val_err:
         return jsonify({"error": f"Could not open Excel file: {str(val_err)}"}), 400
 
@@ -330,8 +532,7 @@ def generate():
     try:
         student_courses, loaded_slots, course_meta, enrolled_counts = load_data(temp_path)
     except Exception as e:
-        app.logger.exception("Error loading uploaded workbook")
-        return jsonify({"error": "Could not process the uploaded workbook"}), 500
+        return jsonify({"error": f"Error loading data: {str(e)}"}), 500
 
     # Helper: normalize date strings to dd-Mon-YYYY (e.g., 26-Feb-2026)
     import pandas as _pd
@@ -537,12 +738,10 @@ def generate():
     # 2b. Adjust exam dates (move same-day exams to different days where possible)
     # -----------------------------------------------
     try:
-        from main import adjust_exam_dates, validate_schedule
+        from main import adjust_exam_dates
         adjust_exam_dates(final_data, student_courses, slot_meta)
-        violations=validate_schedule(final_data,student_courses)
-        if violations: return jsonify({"error":"Scheduling invariant violated after date adjustment","violations":violations[:25]}),422
     except Exception as adj_err:
-        return jsonify({"error":f"Scheduling post-processing failed: {adj_err}"}),500
+        print(f"adjust_exam_dates warning (non-fatal): {adj_err}")
 
     # -----------------------------------------------
     # 3. Run Stage 2 — Room Allocation
@@ -563,8 +762,7 @@ def generate():
             ]
         room_assignments, unallocated = allocate_rooms(final_data, rooms)
     except Exception as e:
-        app.logger.exception("Room allocation failed")
-        return jsonify({"error": "Room allocation failed"}), 500
+        return jsonify({"error": f"Error in room allocation: {str(e)}"}), 500
 
     # Build a mapping of assigned rooms for quick lookup: (course_id, slot, date) -> rooms_assigned
     room_map = {}
@@ -582,9 +780,7 @@ def generate():
     # -----------------------------------------------
     faculty_status = {}
     try:
-        teachers = load_teacher_data(temp_path)
-        try: os.remove(temp_path)
-        except OSError: pass
+        teachers = load_teacher_data(temp_path, preferences_filepath=temp_pref_path)
         if branch_filter != "ALL":
             # Include teachers from the selected branch OR those marked as 'General' (cross-department)
             teachers = {
@@ -609,8 +805,8 @@ def generate():
                 dc = f.get("duty_counts")
                 if not dc:
                     flat = f.get("duty_count", 0)
-                    role = f.get("role", "Junior")
-                    role_key = role.lower() if role.lower() in ["junior", "senior", "squad"] else "junior"
+                    role = str(f.get("role") or "Junior").strip().lower()
+                    role_key = role if role in ["junior", "senior", "squad"] else "junior"
                     dc = {
                         "squad": flat if role_key == "squad" else 0,
                         "junior": flat if role_key == "junior" else 0,
@@ -724,8 +920,9 @@ def generate():
         except Exception as adj_err:
             print(f"Adjustment apply warning: {adj_err}")
     except Exception as e:
-        app.logger.exception("Teacher assignment failed")
-        return jsonify({"error": "Teacher assignment failed"}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Error in teacher assignment: {str(e)}"}), 500
     # -----------------------
     # Sanitize outputs: convert numpy types to native Python types and ensure strings
     # -----------------------
@@ -751,18 +948,10 @@ def generate():
     # Build mapping course_id -> (date, slot_display)
     course_slot_map = {r["course_id"]: (r["date"], r["slot"]) for r in final_data}
 
-    violations = []
-    for student, courses in student_courses.items():
-        slots_taken = {}
-        for course in courses:
-            cs = course_slot_map.get(course)
-            if not cs: continue
-            date_taken, slot_taken = cs
-            key = (date_taken, slot_taken)
-            if key in slots_taken:
-                violations.append(f"{student}: {course} and {slots_taken[key]} on {date_taken} Slot {slot_taken}")
-            else:
-                slots_taken[key] = course
+    violations = validate_schedule(final_data, student_courses)
+    if violations:
+        app.logger.error("Scheduler invariant violation: %s", violations)
+        return jsonify({"error": "Generated timetable violates a student scheduling constraint", "violations": violations}), 422
 
     preferred_count = sum(1 for a in assignments if a.get("cost", 9999) <= 1)
     pref_pct = round(preferred_count / len(assignments) * 100, 1) if assignments else 0
@@ -793,6 +982,8 @@ def generate():
                 "role"         : a["role_required"],
                 "teacher_id"   : a["teacher_id"],
                 "teacher_name" : a["teacher_name"],
+                "year"         : a.get("year", "ALL"),
+                "department"   : a.get("department", "General"),
                 "last_role"    : faculty_status.get(a["teacher_id"], {}).get("last_role", "N/A"),
                 "is_priority"  : "Yes" if not faculty_status.get(a["teacher_id"], {}).get("has_served_high_role", True) else "No",
                 "room_assigned" : a.get("room") or (
@@ -813,7 +1004,7 @@ def generate():
 
 
 @app.route("/export_excel", methods=["POST"])
-@require_admin
+@require_csrf
 def export_excel():
     """Accepts JSON with keys 'timetable', 'room_allocation', 'teacher_duties' and returns a styled xlsx."""
     data = request.get_json()
@@ -906,7 +1097,6 @@ def export_excel():
 
 @app.route("/confirm", methods=["POST"])
 @require_csrf
-@require_admin
 def confirm():
     data = request.json or {}
     assignments = data.get("teacher_duties", []) or data.get("assignments", [])
@@ -917,9 +1107,10 @@ def confirm():
         from db import get_db, update_faculty_duty, check_reset_fairness, format_date_to_standard
         database = get_db()
         
-        latest=database["timetables"].find_one({"department":dept},sort=[("version",-1)])
-        next_version=int(latest.get("version",0))+1 if latest else 1
-        
+        # Publish as a new immutable timetable version instead of deleting prior history.
+        latest = database["timetables"].find_one({"department": dept}, sort=[("version", -1)])
+        next_version = int(latest.get("version", 0)) + 1 if latest else 1
+
         # Handle both root fields payload (our style) or snapshot payload (remote style)
         timetable_val = data.get("timetable")
         if isinstance(timetable_val, dict):
@@ -940,6 +1131,7 @@ def confirm():
             "summary": summary_val,
             "department": dept,
             "version": next_version,
+            "cleared": False,
             "confirmed_at": datetime.utcnow().isoformat() + "Z"
         })
 
@@ -955,7 +1147,7 @@ def confirm():
                 is_high_role=is_high,
                 course_id=a.get("course_id"),
                 room_assigned=a.get("room_assigned"),
-                session=a.get("session"), year=a.get("year","ALL"), department=a.get("department","General")
+                session=a.get("session"), year=a.get("year", "ALL"), department=a.get("department", "General")
             )
 
         # After adding new assignments, remove any previous/original duty history entries
@@ -997,76 +1189,62 @@ def confirm():
 
         reset_triggered = check_reset_fairness(department=dept)
         return jsonify({"success": True, "reset_triggered": reset_triggered})
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return safe_server_error()
 
 
 @app.route("/confirmed_timetable", methods=["GET"])
-@require_login
 def get_confirmed_timetable():
-    from db import get_db
     try:
         database = get_db()
-        candidates = []
-
-        # Try primary collection first
-        candidates.extend(list(database["timetables"].find({"cleared":{"$ne":True}})))
-
-        # Fallbacks: try common alternative collection names, then search any collection
-        alt_names = ["timetable", "confirmed_timetable", "confirmed_timelines", "schedule"]
-        for name in alt_names:
-            if name in database.list_collection_names():
-                candidates.extend(list(database[name].find()))
-
-        if not candidates:
-            for coll in database.list_collection_names():
-                try:
-                    candidates.extend(list(database[coll].find({"$or": [{"teacher_duties": {"$exists": True}}, {"timetable": {"$exists": True}}]})))
-                except Exception:
-                    continue
-
-        t = select_best_timetable_doc(candidates)
+        t = database["timetables"].find_one({"cleared": {"$ne": True}}, sort=[("confirmed_at", -1)])
         if t:
             t = dict(t)
             t["_id"] = str(t["_id"])
             return jsonify(t)
         return jsonify(None)
-    except Exception as e:
+    except Exception:
         return safe_server_error()
 
 
-@app.route("/timetable/versions")
+@app.route("/timetable/versions", methods=["GET"])
 @require_admin
 def timetable_versions():
-    docs=list(get_db()["timetables"].find({}, {"_id":1,"department":1,"version":1,"confirmed_at":1,"summary":1}).sort([("department",1),("version",-1)]))
-    for d in docs: d["_id"]=str(d["_id"])
+    docs = list(get_db()["timetables"].find({}, {"_id": 1, "department": 1, "version": 1, "confirmed_at": 1, "summary": 1, "cleared": 1}).sort([("department", 1), ("version", -1)]))
+    for d in docs:
+        d["_id"] = str(d["_id"])
     return jsonify(docs)
+
 
 @app.route("/timetable/rollback", methods=["POST"])
 @require_csrf
 @require_admin
 def timetable_rollback():
-    data=request.get_json() or {}; department=data.get("department","IT")
-    try: version=int(data.get("version"))
-    except: return jsonify({"error":"Version must be an integer"}),400
-    db=get_db(); src=db["timetables"].find_one({"department":department,"version":version})
-    if not src: return jsonify({"error":"Timetable version not found"}),404
-    latest=db["timetables"].find_one({"department":department},sort=[("version",-1)]); nv=int(latest.get("version",0))+1
-    clone={k:v for k,v in src.items() if k!="_id"}; clone.update({"version":nv,"rollback_of":version,"cleared":False,"confirmed_at":datetime.utcnow().isoformat()+"Z"}); db["timetables"].insert_one(clone)
-    return jsonify({"success":True,"version":nv,"rollback_of":version})
+    data = request.get_json() or {}
+    department = str(data.get("department", "IT"))
+    try:
+        version = int(data.get("version"))
+    except Exception:
+        return jsonify({"error": "Version must be an integer"}), 400
+    database = get_db()
+    source = database["timetables"].find_one({"department": department, "version": version})
+    if not source:
+        return jsonify({"error": "Timetable version not found"}), 404
+    latest = database["timetables"].find_one({"department": department}, sort=[("version", -1)])
+    next_version = int(latest.get("version", 0)) + 1 if latest else 1
+    clone = {k: v for k, v in source.items() if k != "_id"}
+    clone.update({"version": next_version, "rollback_of": version, "cleared": False, "confirmed_at": datetime.utcnow().isoformat() + "Z"})
+    database["timetables"].insert_one(clone)
+    return jsonify({"success": True, "version": next_version, "rollback_of": version})
+
 
 @app.route("/clear_confirmed_timetable", methods=["POST"])
 @require_csrf
-@require_admin
 def clear_confirmed_timetable():
-    from db import get_db
     try:
-        database = get_db()
-        database["timetables"].update_many({"cleared":{"$ne":True}},{"$set":{"cleared":True,"cleared_at":datetime.utcnow().isoformat()+"Z"}})
+        get_db()["timetables"].update_many({"cleared": {"$ne": True}}, {"$set": {"cleared": True, "cleared_at": datetime.utcnow().isoformat() + "Z"}})
         return jsonify({"success": True, "message": "Confirmed timetable cleared successfully."})
-    except Exception as e:
+    except Exception:
         return safe_server_error()
 
 
@@ -1086,11 +1264,16 @@ def allowed_file(filename):
 
 @app.route("/request_adjustment", methods=["POST"])
 @require_csrf
-@require_login
 def request_adjustment():
     from db import get_db, format_date_to_standard
     
-    teacher_id = session.get("teacher_id") or request.form.get("teacher_id", "").strip()
+    teacher_id = request.form.get("teacher_id", "").strip()
+
+    # Never trust the teacher_id supplied by the browser for a faculty request.
+    # The authenticated session is the source of truth.
+    if not session.get("is_admin"):
+        teacher_id = session.get("user_id", "").strip()
+
     current_date = format_date_to_standard(request.form.get("current_date", "").strip())
     current_slot = request.form.get("current_slot", "").strip()
     current_session = request.form.get("current_session", "").strip()
@@ -1152,7 +1335,6 @@ def request_adjustment():
 
 
 @app.route("/adjustments", methods=["GET"])
-@require_admin
 def get_adjustments():
     from db import get_db
     try:
@@ -1169,7 +1351,6 @@ def get_adjustments():
 
 
 @app.route("/adjustments/alternatives", methods=["GET"])
-@require_admin
 def get_alternatives():
     from db import get_db, format_date_to_standard
     request_id = request.args.get("request_id")
@@ -1306,7 +1487,6 @@ def get_alternatives():
 
 @app.route("/approve_adjustment", methods=["POST"])
 @require_csrf
-@require_admin
 def approve_adjustment():
     from db import get_db, format_date_to_standard
     data = request.json or {}
@@ -1338,24 +1518,23 @@ def approve_adjustment():
             partner_doc = database["teachers"].find_one({"$or": [{"teacher_id": swap_teacher_id}, {"email": swap_teacher_id}]})
             if not req_doc or not partner_doc:
                 return jsonify({"error": "Requester or Swap partner not found"}), 404
-                
+
+            from main import normalize_year
+            def _eligible(teacher, duty):
+                allowed = set(teacher.get("teaching_years", []))
+                year = normalize_year(duty.get("year", "ALL"))
+                return ("ALL" in allowed or year in allowed)
+
             # Extract items
             req_item = next((h for h in req_doc.get("history", []) if h.get("exam_date") == current_date and str(h.get("slot_id") or h.get("slot")) == str(current_slot)), {})
             partner_item = next((h for h in partner_doc.get("history", []) if h.get("exam_date") == new_date and str(h.get("slot_id") or h.get("slot")) == str(new_slot)), {})
-            
             if not req_item or not partner_item:
-                return jsonify({"error":"The requested duties could not be found in current faculty history"}),409
-            from main import normalize_year
-            def eligible_for_history(teacher,duty):
-                allowed=set(teacher.get("teaching_years",[]))
-                return "ALL" in allowed or normalize_year(duty.get("year","ALL")) in allowed
+                return jsonify({"error": "The requested duties could not be found in current faculty history"}), 409
             if req_item.get("role_assigned") != partner_item.get("role_assigned"):
-                return jsonify({"error":"Swap partners must have the same invigilation role"}),422
-            if not eligible_for_history(req_doc,partner_item):
-                return jsonify({"error":"Requester is not eligible for the target exam year"}),422
-            if not eligible_for_history(partner_doc,req_item):
-                return jsonify({"error":"Swap partner is not eligible for the target exam year"}),422
-
+                return jsonify({"error": "Swap partners must have the same invigilation role"}), 422
+            if not _eligible(req_doc, partner_item) or not _eligible(partner_doc, req_item):
+                return jsonify({"error": "Swap would violate teacher academic-year eligibility"}), 422
+            
             # Swap histories in DB
             res1 = database["teachers"].update_one(
                 {"$or": [{"teacher_id": requester_id}, {"email": requester_id}], "history.exam_date": current_date, "history.slot_id": str(current_slot)},
@@ -1384,10 +1563,15 @@ def approve_adjustment():
             )
             
         else: # direct move
+            req_doc = database["teachers"].find_one({"$or": [{"teacher_id": requester_id}, {"email": requester_id}]})
+            if not req_doc:
+                return jsonify({"error": "Requester teacher not found"}), 404
             # Try to look up another teacher's duty in the target slot to match the session/course/room details
             target_course = "ALL"
             target_room = "TBD"
             target_session = "TBD"
+            target_year = "ALL"
+            target_department = "General"
             
             # Find a template duty scheduled in that target slot from other teachers' history
             all_teachers = list(database["teachers"].find())
@@ -1397,23 +1581,17 @@ def approve_adjustment():
                         target_course = h.get("course_id", "ALL")
                         target_room = h.get("room_assigned", "TBD")
                         target_session = h.get("session", "TBD")
+                        target_year = h.get("year", "ALL")
+                        target_department = h.get("department", "General")
                         break
                 if target_room != "TBD":
                     break
-                    
-            from main import normalize_year
-            req_doc = database["teachers"].find_one({"$or":[{"teacher_id":requester_id},{"email":requester_id}]})
-            if not req_doc:
-                return jsonify({"error":"Requester teacher not found"}),404
-            req_item = next((h for h in req_doc.get("history",[]) if h.get("exam_date")==current_date and str(h.get("slot_id") or h.get("slot"))==str(current_slot)),{})
-            if not req_item:
-                return jsonify({"error":"Current duty not found"}),409
-            target_item = next((h for t in all_teachers for h in t.get("history",[]) if h.get("exam_date")==new_date and str(h.get("slot_id") or h.get("slot"))==str(new_slot)),{})
-            target_year=normalize_year(target_item.get("year","ALL"))
-            allowed=set(req_doc.get("teaching_years",[]))
-            if "ALL" not in allowed and target_year not in allowed:
-                return jsonify({"error":"Teacher is not eligible for the target exam year"}),422
 
+            from main import normalize_year
+            allowed_years = {normalize_year(v) for v in req_doc.get("teaching_years", [])}
+            if target_year != "ALL" and "ALL" not in allowed_years and normalize_year(target_year) not in allowed_years:
+                return jsonify({"error": "Requester is not eligible for the target exam year"}), 422
+                    
             res1 = database["teachers"].update_one(
                 {"$or": [{"teacher_id": requester_id}, {"email": requester_id}], "history.exam_date": current_date, "history.slot_id": str(current_slot)},
                 {"$set": {
@@ -1421,7 +1599,7 @@ def approve_adjustment():
                     "history.$.slot_id": str(new_slot),
                     "history.$.course_id": target_course,
                     "history.$.year": target_year,
-                    "history.$.department": target_item.get("department", "General"),
+                    "history.$.department": target_department,
                     "history.$.room_assigned": target_room,
                     "history.$.session": target_session
                 }}
@@ -1438,6 +1616,23 @@ def approve_adjustment():
                 "swap_teacher_id": swap_teacher_id if action_type == "swap" else None
             }}
         )
+
+        # Atomically update confirmed timetable document in MongoDB so exports and views reflect swap
+        try:
+            update_confirmed_timetable_swap(
+                action_type=action_type,
+                requester_id=requester_id,
+                current_date=current_date,
+                current_slot=current_slot,
+                new_date=new_date,
+                new_slot=new_slot,
+                swap_teacher_id=swap_teacher_id if action_type == "swap" else None,
+                target_course=target_course if action_type != "swap" else "ALL",
+                target_room=target_room if action_type != "swap" else "TBD",
+                target_session=target_session if action_type != "swap" else "TBD"
+            )
+        except Exception as tt_sync_err:
+            print(f"Warning: Timetable document sync on swap failed: {tt_sync_err}")
         
         return jsonify({"success": True, "message": "Adjustment approved successfully!"})
         
@@ -1449,7 +1644,6 @@ def approve_adjustment():
 
 @app.route("/reject_adjustment", methods=["POST"])
 @require_csrf
-@require_admin
 def reject_adjustment():
     from db import get_db
     data = request.json or {}
@@ -1475,13 +1669,18 @@ def reject_adjustment():
 
 
 @app.route("/teacher/status", methods=["GET"])
-@require_login
 def get_teacher_status():
     from db import get_db
-    identifier = request.args.get("identifier")
+    identifier = request.args.get("identifier", "").strip()
+
+    # Faculty may only read their own status. Coordinators may inspect any
+    # faculty member when the identifier is explicitly supplied.
+    if not session.get("is_admin"):
+        identifier = session.get("identifier", "")
+
     if not identifier:
-        return jsonify({"error":"Missing identifier"}),400
-    if not session.get("is_admin") and identifier not in {session.get("teacher_id"),session.get("email")}: return jsonify({"error":"You can only view your own teacher status"}),403
+        return jsonify({"error": "Missing identifier"}), 400
+
     try:
         database = get_db()
         user = database["teachers"].find_one({
@@ -1503,166 +1702,108 @@ def get_teacher_status():
         })
     except Exception as e:
         return safe_server_error()
-def select_best_timetable_doc(candidates):
-    """Pick the most relevant published timetable document from a list of candidates."""
-    valid_candidates = [doc for doc in candidates if doc]
-    if not valid_candidates:
-        return None
-
-    def score(doc):
-        duties = doc.get("teacher_duties") or []
-        timetable_rows = doc.get("timetable") or []
-        duties_count = len(duties) if isinstance(duties, list) else 0
-        timetable_count = len(timetable_rows) if isinstance(timetable_rows, list) else 0
-        confirmed_at = doc.get("confirmed_at") or ""
-        return (1 if duties_count > 0 or timetable_count > 0 else 0, int(doc.get("version",0) or 0), duties_count, timetable_count, confirmed_at)
-
-    return max(valid_candidates, key=score)
 
 
-def build_all_teacher_duties_payload(timetable_doc, teachers):
-    """Build duties export payload from the latest confirmed timetable first, then fall back to teacher history."""
-    if not isinstance(timetable_doc, dict):
-        timetable_doc = {}
-
-    assignments = timetable_doc.get("teacher_duties", []) or []
-    if assignments:
-        teacher_lookup = {}
-        for teacher in teachers or []:
-            teacher_id = teacher.get("teacher_id") or teacher.get("email")
-            if teacher_id:
-                teacher_lookup[str(teacher_id)] = teacher
-            teacher_email = teacher.get("email")
-            if teacher_email:
-                teacher_lookup[str(teacher_email)] = teacher
-
-        duties = []
-        for assignment in assignments:
-            teacher_id = assignment.get("teacher_id") or assignment.get("teacherId") or assignment.get("teacher")
-            if not teacher_id:
-                continue
-
-            teacher_doc = teacher_lookup.get(str(teacher_id)) or teacher_lookup.get(teacher_id)
-            teacher_name = assignment.get("teacher_name") or assignment.get("teacher") or (teacher_doc.get("name") if teacher_doc else "Unknown")
-            role = assignment.get("role") or assignment.get("role_required") or (teacher_doc.get("last_role") if teacher_doc else "Junior")
-
-            duties.append({
-                "slot": assignment.get("slot") or assignment.get("slot_id"),
-                "date": assignment.get("date"),
-                "session": assignment.get("session", "TBD"),
-                "course_id": assignment.get("course_id", "ALL"),
-                "role": role,
-                "teacher_id": teacher_id,
-                "teacher_name": teacher_name,
-                "last_role": teacher_doc.get("last_role", "N/A") if teacher_doc else "N/A",
-                "is_priority": "Yes" if teacher_doc and not teacher_doc.get("has_served_high_role", True) else "No",
-                "room_assigned": assignment.get("room_assigned") or assignment.get("room") or "TBD"
-            })
-        return duties
-
-    active_dates = set()
-    for row in timetable_doc.get("timetable", []) or []:
-        d_val = row.get("date")
-        if d_val:
-            active_dates.add(str(d_val).strip())
-
-    for row in timetable_doc.get("teacher_duties", []) or []:
-        d_val = row.get("date")
-        if d_val:
-            active_dates.add(str(d_val).strip())
-
-    if not active_dates:
-        active_dates = None
-
-    duties = []
-    for teacher in teachers or []:
-        teacher_id = teacher.get("teacher_id") or teacher.get("email")
-        name = teacher.get("name", "Unknown")
-        last_role = teacher.get("last_role", "N/A")
-        is_priority = "Yes" if not teacher.get("has_served_high_role", True) else "No"
-
-        for h in teacher.get("history", []):
-            exam_date = h.get("exam_date")
-            if exam_date and (active_dates is None or str(exam_date).strip() in active_dates):
-                duties.append({
-                    "slot": h.get("slot_id") or h.get("slot"),
-                    "date": exam_date,
-                    "session": h.get("session", "TBD"),
-                    "course_id": h.get("course_id", "ALL"),
-                    "role": h.get("role_assigned") or h.get("role") or "Junior",
-                    "teacher_id": teacher_id,
-                    "teacher_name": name,
-                    "last_role": last_role,
-                    "is_priority": is_priority,
-                    "room_assigned": h.get("room_assigned") or h.get("room") or "TBD"
-                })
-    return duties
-
-
-@app.route("/api/timetable/duties", methods=["GET"])
-def get_all_teacher_duties():
+@app.route("/download_confirmed_excel", methods=["GET"])
+def download_confirmed_excel():
+    """Directly download the currently published timetable from MongoDB as a styled Excel workbook."""
     from db import get_db
     try:
         database = get_db()
-        candidates = []
-
-        # Primary location: 'timetables' collection
-        candidates.extend(list(database["timetables"].find()))
-
-        # Fallbacks: try common alternative collection names
-        alt_names = ["timetable", "confirmed_timetable", "confirmed_timelines", "schedule"]
-        for name in alt_names:
-            if name in database.list_collection_names():
-                candidates.extend(list(database[name].find()))
-
-        # Last resort: scan collections for documents that look like a confirmed timetable
-        if not candidates:
-            for coll in database.list_collection_names():
-                try:
-                    candidates.extend(list(database[coll].find({"$or": [{"teacher_duties": {"$exists": True}}, {"timetable": {"$exists": True}}]})))
-                except Exception:
-                    continue
-
-        timetable_doc = select_best_timetable_doc(candidates)
-        if not timetable_doc:
-            return jsonify({"error": "No confirmed timetable found"}), 404
-
-        teachers = list(database["teachers"].find())
-        all_duties = build_all_teacher_duties_payload(timetable_doc, teachers)
-
-        return jsonify({"duties": all_duties})
-    except Exception as e:
-        return safe_server_error()
-
-
-@app.route("/api/teacher/duties", methods=["GET"])
-@require_login
-def get_teacher_duties():
-    """Return a teacher document and history for PDF generation (frontend expects this)."""
-    from db import get_db
-    teacher_id = request.args.get("teacher_id")
-    if not teacher_id:
-        return jsonify({"error":"Missing teacher_id"}),400
-    if not session.get("is_admin") and teacher_id not in {session.get("teacher_id"),session.get("email")}: return jsonify({"error":"You can only view your own duties"}),403
-    try:
-        database = get_db()
-        t = database["teachers"].find_one({"$or": [{"teacher_id": teacher_id}, {"email": teacher_id}]})
+        t = database["timetables"].find_one(sort=[("_id", -1)])
         if not t:
-            return jsonify({"error": "Teacher not found"}), 404
+            return jsonify({"error": "No confirmed timetable found in MongoDB to export. Please generate and publish a timetable first."}), 404
 
-        # Normalize response shape expected by the frontend PDF generator
-        resp = {
-            "teacher_id": t.get("teacher_id") or t.get("email"),
-            "name": t.get("name", "Unknown"),
-            "last_role": t.get("last_role", "N/A"),
-            "has_served_high_role": t.get("has_served_high_role", True),
-            "history": t.get("history", [])
+        tables = {
+            'Timetable': t.get('timetable', []),
+            'Room Allocation': t.get('room_allocation', []),
+            'Teacher Duties': t.get('teacher_duties', [])
         }
-        return jsonify(resp)
+
+        # Build room_map
+        room_map = {}
+        for r in tables.get('Room Allocation', []):
+            key = (str(r.get('course_id')), str(r.get('slot')), str(r.get('date')))
+            room_map[key] = r.get('rooms_assigned', '')
+
+        # Merge Room Assigned into Timetable
+        tt = []
+        for row in tables.get('Timetable', []):
+            key = (str(row.get('course_id')), str(row.get('slot')), str(row.get('date')))
+            new = dict(row)
+            new['Room Assigned'] = room_map.get(key, '')
+            tt.append(new)
+        tables['Timetable'] = tt
+
+        # Prepare Teacher Duties
+        td = []
+        for row in tables.get('Teacher Duties', []):
+            new = {k: v for k, v in row.items() if k != 'preferred'}
+            key = (str(row.get('course_id')), str(row.get('slot')), str(row.get('date')))
+            if row.get('course_id') == 'ALL':
+                role = row.get('role') or row.get('role_required')
+                new['Room Assigned'] = 'Control' if role == 'Senior' else 'Roaming'
+            else:
+                new['Room Assigned'] = room_map.get(key, '')
+            td.append(new)
+        tables['Teacher Duties'] = td
+
+        # Build workbook in memory
+        out = BytesIO()
+        with pd.ExcelWriter(out, engine='openpyxl') as writer:
+            for name, rows in tables.items():
+                df = pd.DataFrame(rows)
+                if df.empty:
+                    df = pd.DataFrame(columns=["Empty"])
+                df.to_excel(writer, sheet_name=name[:31], index=False)
+        out.seek(0)
+
+        wb = load_workbook(out)
+        thin = Side(border_style="thin", color="000000")
+        for ws in wb.worksheets:
+            for cell in next(ws.iter_rows(min_row=1, max_row=1)):
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill(start_color="6366F1", end_color="6366F1", fill_type="solid")
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+            for col in ws.columns:
+                max_len = 0
+                col_letter = col[0].column_letter
+                for cell in col:
+                    if cell.value is None: continue
+                    v = str(cell.value)
+                    if len(v) > max_len: max_len = len(v)
+                ws.column_dimensions[col_letter].width = max_len + 2
+
+            for row in ws.iter_rows(min_row=1, max_col=ws.max_column, max_row=ws.max_row):
+                for cell in row:
+                    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            ws.freeze_panes = 'A2'
+
+        bio = BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+
+        return send_file(bio, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='PICT_Confirmed_Timetable.xlsx')
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return safe_server_error()
+
+
+@app.route("/download_sample/<sample_type>", methods=["GET"])
+def download_sample(sample_type):
+    """Download sample exam data Excel or sample teacher preferences CSV."""
+    if sample_type == "excel":
+        file_path = os.path.join(BASE_DIR, "sample_exam_data.xlsx")
+        if not os.path.exists(file_path):
+            from generate_sample_excel import generate
+            generate()
+        return send_file(file_path, as_attachment=True, download_name="sample_exam_data.xlsx")
+    elif sample_type == "preferences" or sample_type == "csv":
+        file_path = os.path.join(BASE_DIR, "sample_teacher_preferences.csv")
+        return send_file(file_path, as_attachment=True, download_name="sample_teacher_preferences.csv", mimetype="text/csv")
+    else:
+        return jsonify({"error": "Unknown sample type. Use 'excel' or 'preferences'."}), 404
 
 
 if __name__ == "__main__":
