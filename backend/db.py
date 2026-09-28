@@ -102,6 +102,28 @@ def migrate_db_schema():
                     update_op["$unset"] = unset_fields
                 faculty_col.update_one({"_id": f["_id"]}, update_op)
 
+        # Teacher schema defaults. Teaching eligibility is intentionally NOT
+        # inferred from the exam workbook. Existing records without an explicit
+        # teaching_years value are initialized as an empty list and must be
+        # configured by the coordinator before they can receive duties.
+        for f in faculty_col.find():
+            set_fields = {}
+            if "teacher_id" not in f and f.get("email"):
+                set_fields["teacher_id"] = str(f["email"]).split("@")[0]
+            if "email" not in f and f.get("teacher_id"):
+                set_fields["email"] = f"{f['teacher_id']}@pict.edu"
+            if "department" not in f:
+                set_fields["department"] = "General"
+            if "teaching_years" not in f:
+                set_fields["teaching_years"] = []
+            if "duty_counts" not in f:
+                set_fields["duty_counts"] = {"squad": 0, "junior": 0, "senior": 0}
+            if "has_served_high_role" not in f: set_fields["has_served_high_role"] = False
+            if "last_role" not in f: set_fields["last_role"] = "N/A"
+            if "history" not in f: set_fields["history"] = []
+            if set_fields:
+                faculty_col.update_one({"_id": f["_id"]}, {"$set": set_fields})
+
         # Normalize adjustments dates to %d-%b-%Y
         adjustments_col = database["adjustments"]
         for adj in adjustments_col.find():
@@ -136,6 +158,11 @@ def get_db():
             new_db.command("ping")
             db = new_db
             migrate_db_schema()
+            new_db["teachers"].create_index("teacher_id", unique=True, sparse=True)
+            new_db["teachers"].create_index("email", unique=True, sparse=True)
+            new_db["adjustments"].create_index([("status",1),("created_at",-1)])
+            new_db["timetables"].create_index([("department",1),("version",-1)])
+            new_db["timetables"].create_index([("confirmed_at",-1)])
         except Exception:
             client = None
             db = None
@@ -173,12 +200,12 @@ def init_faculty(teachers_data):
                 "name"                : t_info["name"],
                 "role"                : t_info.get("role", "Junior"),
                 "department"          : t_info.get("department", "IT"),
+                "teaching_years"      : [],
                 "has_served_high_role": False,
                 "duty_counts"         : { "squad": 0, "junior": 0, "senior": 0 },
                 "last_role"           : "N/A",
                 "history"             : [],
-                # Default password = teacher_id (e.g. "T1"), not the full email
-                "password_hash"       : generate_password_hash(t_id)
+                "password_hash"       : None
             })
         else:
             # Keep name/role in sync with Excel in case it was updated
@@ -186,6 +213,7 @@ def init_faculty(teachers_data):
                 "teacher_id": t_id,
                 "name"      : t_info["name"],
                 "role"      : t_info.get("role", existing.get("role", "Junior")),
+                "department": existing.get("department", "General"),
             }
             if "duty_counts" not in existing:
                 flat_count = existing.get("duty_count", 0)
@@ -203,13 +231,32 @@ def init_faculty(teachers_data):
             )
 
 
+def set_teacher_eligibility(teacher_id, teaching_years, department=None):
+    """Coordinator-only data operation for the authoritative teacher eligibility."""
+    database = get_db()
+    normalized = []
+    for value in teaching_years or []:
+        v = str(value).strip().upper().replace(" ", "")
+        aliases = {"1":"FY","2":"SY","3":"TY","4":"BTECH","B.TECH":"BTECH"}
+        v = aliases.get(v, v)
+        if v in {"FY", "SY", "TY", "BTECH", "ALL"} and v not in normalized:
+            normalized.append(v)
+    if not normalized:
+        raise ValueError("At least one teaching year is required")
+    fields = {"teaching_years": normalized}
+    if department is not None and str(department).strip():
+        fields["department"] = str(department).strip()
+    result = database["teachers"].update_one({"teacher_id": teacher_id}, {"$set": fields})
+    return result.matched_count > 0
+
+
 def get_priority_faculty():
     """Fetch faculty where has_served_high_role == False."""
     database = get_db()
     return list(database["teachers"].find({"has_served_high_role": False}))
 
 
-def update_faculty_duty(teacher_id, role, date, slot_id, is_high_role=False, course_id=None, room_assigned=None, session=None):
+def update_faculty_duty(teacher_id, role, date, slot_id, is_high_role=False, course_id=None, room_assigned=None, session=None, year=None, department=None):
     """
     Update faculty duty status after confirmation.
 
@@ -237,6 +284,8 @@ def update_faculty_duty(teacher_id, role, date, slot_id, is_high_role=False, cou
                 "exam_date": date,
                 "role_assigned": role,
                 "course_id": course_id or "ALL",
+                "year": year or "ALL",
+                "department": department or "General",
                 "room_assigned": room_assigned,
                 "session": session or "TBD",
                 "assigned_at": datetime.utcnow().isoformat() + "Z"

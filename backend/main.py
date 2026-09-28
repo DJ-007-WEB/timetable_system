@@ -104,41 +104,61 @@ def dsatur_coloring(graph):
     return result
 
 
+def normalize_year(value):
+    """Normalize FY/SY/TY/B.Tech labels to canonical year names."""
+    v = safe_str(value, default="ALL").upper().replace(" ", "").replace("-", "")
+    aliases = {"1":"FY","FY":"FY","FIRST":"FY","FIRSTYEAR":"FY","2":"SY","SY":"SY","SECOND":"SY","SECONDYEAR":"SY","3":"TY","TY":"TY","THIRD":"TY","THIRDYEAR":"TY","4":"BTECH","B.TECH":"BTECH","BTECH":"BTECH","BT":"BTECH","FINAL":"BTECH","FINALYEAR":"BTECH","4TH":"BTECH"}
+    return aliases.get(v, v)
+
+def validate_schedule(final_data, student_courses):
+    course_slot={str(r.get("course_id")):(str(r.get("date","")),str(r.get("slot",""))) for r in final_data}
+    violations=[]
+    for student,courses in student_courses.items():
+        seen={}
+        for course in courses:
+            key=course_slot.get(str(course))
+            if key is None: continue
+            if key in seen: violations.append(f"{student}: {course} and {seen[key]} on {key[0]} Slot {key[1]}")
+            else: seen[key]=course
+    return violations
+
 def adjust_exam_dates(final_data, student_courses, slot_meta):
-    """
-    Ensure students with multiple exams have them on separate days if possible.
-    """
-    next_day_slots = {1: [], 2: []}
-    for slot, meta in slot_meta.items():
-        if meta["session"] == "Morning":
-            next_day_slots[1].append(slot)
-        elif meta["session"] == "Afternoon":
-            next_day_slots[2].append(slot)
-
-    for student, courses in student_courses.items():
-        assigned_slots = {course: None for course in courses}
-        for row in final_data:
-            if row["course_id"] in assigned_slots:
-                assigned_slots[row["course_id"]] = row["date"]
-
-        for course1, course2 in combinations(courses, 2):
-            if assigned_slots[course1] == assigned_slots[course2]:
-                if next_day_slots[1]:
-                    new_slot = next_day_slots[1].pop(0)
-                    for idx, row in enumerate(final_data):
-                        if row["course_id"] == course2:
-                            final_data[idx]["slot"] = slot_meta[new_slot]["display_id"]
-                            final_data[idx]["date"] = slot_meta[new_slot]["date"]
-                            final_data[idx]["session"] = slot_meta[new_slot]["session"]
-                            break
-                elif next_day_slots[2]:
-                    new_slot = next_day_slots[2].pop(0)
-                    for idx, row in enumerate(final_data):
-                        if row["course_id"] == course2:
-                            final_data[idx]["slot"] = slot_meta[new_slot]["display_id"]
-                            final_data[idx]["date"] = slot_meta[new_slot]["date"]
-                            final_data[idx]["session"] = slot_meta[new_slot]["session"]
-                            break
+    """Safely spread same-day exams; every accepted move is revalidated."""
+    candidates=[]
+    for key,meta in slot_meta.items():
+        if meta.get("date"):
+            candidates.append({"slot":meta.get("display_id",key+1),"date":meta["date"],"session":meta.get("session","TBD")})
+    candidates.sort(key=lambda x:(str(x["date"]),str(x["slot"])))
+    course_to_students={}
+    for student,courses in student_courses.items():
+        for course in set(courses): course_to_students.setdefault(str(course),set()).add(str(student))
+    row_by_course={str(r["course_id"]):r for r in final_data}
+    moved=[]
+    changed=True
+    while changed:
+        changed=False
+        for student,courses in student_courses.items():
+            by_date={}
+            for course in courses:
+                row=row_by_course.get(str(course))
+                if row: by_date.setdefault(str(row.get("date","")),[]).append(row)
+            duplicate=next((rows for rows in by_date.values() if len(rows)>1),None)
+            if not duplicate: continue
+            row=duplicate[-1]; original=(str(row.get("date")),str(row.get("slot")))
+            ordered=sorted(candidates,key=lambda c:(str(c["date"])==original[0],str(c["date"]),str(c["slot"])))
+            for cand in ordered:
+                target=(str(cand["date"]),str(cand["slot"]))
+                if target==original: continue
+                conflict=False
+                for other in final_data:
+                    if other is row or (str(other.get("date")),str(other.get("slot")))!=target: continue
+                    if course_to_students.get(str(row["course_id"]),set()) & course_to_students.get(str(other["course_id"]),set()): conflict=True; break
+                if conflict: continue
+                old=dict(row); row.update({"slot":cand["slot"],"date":cand["date"],"session":cand["session"]})
+                if validate_schedule(final_data,student_courses): row.clear(); row.update(old); continue
+                moved.append({"course_id":row["course_id"],"from":original,"to":target}); changed=True; break
+            if changed: break
+    return moved
 
 
 # ================================================
@@ -263,59 +283,24 @@ def load_room_data(filepath):
 
 
 def allocate_rooms(final_data, rooms):
-    room_assignments = []
-    unallocated = []
-    usage_counter = {r["room_id"]: 0 for r in rooms}
-    # Track used rooms per unique (date, slot) combination
-    slot_used_rooms = {}
-
-    # Sort by date then slot then descending students so larger groups get first pick
-    sorted_data = sorted(final_data, key=lambda x: (x.get("date", ""), x.get("slot", 0), -x.get("enrolled_students", 0)))
-
-    for row in sorted_data:
-        students = row.get("enrolled_students", 0)
-        slot = row.get("slot")
-        date = row.get("date")
-        if students == 0: students = row.get("declared_students", 0)
-        slot_key = (date, slot)
-        used_in_slot = slot_used_rooms.setdefault(slot_key, set())
-        available = [r for r in rooms if r["room_id"] not in used_in_slot]
-        available.sort(key=lambda r: (r["capacity"], usage_counter[r["room_id"]]))
-
-        assigned = []
-        total_cap = 0
-        temp_students = students
-
-        # First try: find the smallest single room that fits all students
-        single_fit = [r for r in available if r["capacity"] >= temp_students]
-        if single_fit:
-            best = min(single_fit, key=lambda r: (r["capacity"], usage_counter[r["room_id"]]))
-            assigned = [best["room_id"]]
-            total_cap = best["capacity"]
-            used_in_slot.add(best["room_id"])
-            usage_counter[best["room_id"]] += 1
-        else:
-            # Fallback: combine rooms (previous behavior)
-            while temp_students > 0 and available:
-                # pick largest available (to reduce number of rooms) but prefer least used
-                best_room = max(available, key=lambda r: (r["capacity"], -usage_counter[r["room_id"]]))
-                assigned.append(best_room["room_id"])
-                total_cap += best_room["capacity"]
-                temp_students -= best_room["capacity"]
-                used_in_slot.add(best_room["room_id"])
-                usage_counter[best_room["room_id"]] += 1
-                available = [r for r in available if r["room_id"] not in used_in_slot]
-
-        res = {
-            **row,
-            "rooms_assigned": ", ".join(assigned) if assigned else "None",
-            "total_capacity": total_cap,
-            "status": "Allocated" if total_cap >= students else "Partial"
-        }
+    """Capacity-aware room selection: fewest rooms, least waste, lower usage."""
+    room_assignments=[]; unallocated=[]; usage={r["room_id"]:0 for r in rooms}; used_slots={}
+    for row in sorted(final_data,key=lambda x:(x.get("date",""),x.get("slot",0),-x.get("enrolled_students",0))):
+        students=row.get("enrolled_students",0) or row.get("declared_students",0); key=(row.get("date"),row.get("slot")); used=used_slots.setdefault(key,set()); available=[r for r in rooms if r["room_id"] not in used]
+        dp={0:(0,0,[])}
+        for room in available:
+            cap=max(0,int(room["capacity"])); rid=room["room_id"]; use=usage[rid]
+            for total in sorted(list(dp),reverse=True):
+                nt=total+cap; cand=(dp[total][0]+1,dp[total][1]+use,dp[total][2]+[rid])
+                if nt not in dp or cand[:2]<dp[nt][:2]: dp[nt]=cand
+        feasible=[(cap,v) for cap,v in dp.items() if cap>=students and v[2]]
+        if feasible: total_cap,(_,_,assigned)=min(feasible,key=lambda x:(x[1][0],x[0]-students,x[1][1]))
+        else: total_cap,assigned=0,[]
+        for rid in assigned: used.add(rid); usage[rid]+=1
+        res={**row,"rooms_assigned":", ".join(assigned) if assigned else "None","total_capacity":total_cap,"status":"Allocated" if total_cap>=students else "Partial"}
         room_assignments.append(res)
-        if total_cap < students: unallocated.append(res)
-
-    return room_assignments, unallocated
+        if total_cap<students: unallocated.append(res)
+    return room_assignments,unallocated
 
 
 # ================================================
@@ -323,18 +308,51 @@ def allocate_rooms(final_data, rooms):
 # ================================================
 
 def load_teacher_data(filepath):
+    """Load teacher identity from Excel and eligibility/preferences from MongoDB.
+
+    The exam workbook deliberately does NOT contain teaching_years. MongoDB is
+    the authoritative source for which academic year(s) a teacher may invigilate.
+    """
     df_teachers = pd.read_excel(filepath, sheet_name="Teachers")
-    # Preferences sheet deprecated: preferences ignored; use empty preferred_slots
+    try:
+        df_prefs = pd.read_excel(filepath, sheet_name="Preferences")
+    except Exception:
+        df_prefs = pd.DataFrame(columns=["teacher_id", "preferred_slots"])
     pref_map = {}
+    for _, row in df_prefs.iterrows():
+        tid = safe_id(row.get("teacher_id"))
+        raw = safe_str(row.get("preferred_slots", ""), default="")
+        pref_map[tid] = {str(x).strip() for x in raw.split(",") if str(x).strip()}
+
+    db_teachers = {}
+    try:
+        from db import get_db
+        for doc in get_db()["teachers"].find({}):
+            tid = doc.get("teacher_id") or doc.get("email", "").split("@")[0]
+            if tid:
+                years = doc.get("teaching_years", [])
+                db_teachers[str(tid)] = {
+                    "teaching_years": {normalize_year(v) for v in (years or [])},
+                    "department": safe_str(doc.get("department"), default="General"),
+                    "preferred_slots": {str(x) for x in doc.get("preferred_slots", [])}
+                }
+    except Exception as exc:
+        raise RuntimeError("Unable to load teacher eligibility from MongoDB") from exc
+
     teachers = {}
     for _, row in df_teachers.iterrows():
         t_id = safe_id(row["teacher_id"])
+        mongo = db_teachers.get(t_id)
+        if not mongo:
+            # New teacher records are initialized by init_faculty with no eligibility.
+            mongo = {"teaching_years": set(), "department": "General", "preferred_slots": set()}
         teachers[t_id] = {
             "id": t_id,
             "name": safe_str(row["name"]),
             "role": safe_str(row["role"]),
-            "department": safe_str(row.get("department", "General")),
-            "preferred_slots": set()
+            "department": mongo["department"],
+            "teaching_years": mongo["teaching_years"],
+            "preferred_slots": mongo["preferred_slots"] | pref_map.get(t_id, set())
         }
     return teachers
 
@@ -356,6 +374,8 @@ def build_duties(final_data, room_assignments=None):
             duties.append({
                 "duty_id": duty_id, "slot": row["slot"], "date": row["date"],
                 "session": row["session"], "course_id": row["course_id"],
+                "year": normalize_year(row.get("year", "ALL")),
+                "department": row.get("department", "General"),
                 "room": room, "role_required": "Junior"
             })
             duty_id += 1
@@ -369,6 +389,8 @@ def build_duties(final_data, room_assignments=None):
                 duties.append({
                     "duty_id": duty_id, "slot": row["slot"], "date": row["date"],
                     "session": row["session"], "course_id": "ALL",
+                    "year": normalize_year(row.get("year", "ALL")),
+                    "department": row.get("department", "General"),
                     "room": "Control" if role=="Senior" else "Roaming",
                     "role_required": role
                 })
@@ -377,33 +399,30 @@ def build_duties(final_data, room_assignments=None):
     return duties
 
 
-def compute_cost(teacher, duty, teacher_duty_count, fairness_map=None, db_duty_counts=None, MAX_DUTIES=5):
-    INF = 10_000
-    if teacher["role"] != duty["role_required"]: return INF
-    
-    # Past duties from database
-    past_duties_dict = db_duty_counts.get(teacher["id"], {}) if db_duty_counts else {}
-    past_total = sum(past_duties_dict.values())
-    
-    # Replicated instance number indicates how many duties are being assigned in this pass.
-    # Total duty count = past database duties + instance number
-    inst = teacher.get("instance", 0)
-    total_duty_count = past_total + inst
-    
-    if total_duty_count >= MAX_DUTIES:
-        return INF
-    
-    cost = 10
-    if duty["role_required"] in ["Senior", "Squad"] and fairness_map:
-        if not fairness_map.get(teacher["id"], True): cost = 0.5
-        else: cost = 5
-    
-    if duty["slot"] in teacher.get("preferred_slots", set()):
-        cost = min(cost, 1)
-    
-    # Penalty of 100 * total_duty_count to load-balance
-    cost += total_duty_count * 100
-    return cost
+def _department_matches(teacher_department, duty_department):
+    t=str(teacher_department or "General").strip().upper(); d=str(duty_department or "General").strip().upper()
+    if t in {"GENERAL","COMMON","SHARED",""} or d in {"GENERAL","COMMON","SHARED",""}: return True
+    aliases={"CE":{"CE","COMPUTER","COMPUTER ENGINEERING","COMP"},"IT":{"IT","INFORMATION TECHNOLOGY","INFO TECH"},"ENTC":{"ENTC","E&TC","ELECTRONICS"},"AIDS":{"AIDS","AI&DS","AI","DATA SCIENCE","DS"}}
+    def canon(x):
+        for k,v in aliases.items():
+            if x in v:return k
+        return x
+    return canon(t)==canon(d)
+
+def teacher_can_invigilate(teacher,duty):
+    allowed=teacher.get("teaching_years",set()); year=normalize_year(duty.get("year","ALL"))
+    return ("ALL" in allowed or year in allowed) and _department_matches(teacher.get("department"),duty.get("department"))
+
+def compute_cost(teacher,duty,teacher_duty_count,fairness_map=None,db_duty_counts=None,MAX_DUTIES=5):
+    INF=10000
+    if teacher["role"]!=duty["role_required"] or not teacher_can_invigilate(teacher,duty): return INF
+    past=(db_duty_counts.get(teacher["id"],{}) if db_duty_counts else {})
+    total=sum(past.values())+teacher.get("instance",0)
+    if total>=MAX_DUTIES:return INF
+    cost=10
+    if duty["role_required"] in ["Senior","Squad"] and fairness_map: cost=0.5 if not fairness_map.get(teacher["id"],True) else 5
+    if duty["slot"] in teacher.get("preferred_slots",set()): cost=min(cost,1)
+    return cost+total*100
 
 
 def assign_teachers(teachers, duties, fairness_map=None, db_duty_counts=None, MAX_DUTIES=5):
@@ -471,7 +490,7 @@ def assign_teachers(teachers, duties, fairness_map=None, db_duty_counts=None, MA
             duty = role_duties[c]
 
             # Collision check: same teacher, same slot
-            if any(a["teacher_id"] == teacher["id"] and a["slot"] == duty["slot"] for a in assignments):
+            if any(a["teacher_id"] == teacher["id"] and str(a.get("date")) == str(duty.get("date")) and str(a.get("slot")) == str(duty.get("slot")) for a in assignments):
                 continue
 
             teacher_duty_count[teacher["id"]] += 1
@@ -480,7 +499,7 @@ def assign_teachers(teachers, duties, fairness_map=None, db_duty_counts=None, MA
                 "duty_id": duty["duty_id"], "slot": duty["slot"], "date": duty["date"],
                 "session": duty["session"], "course_id": duty["course_id"],
                 "room": duty["room"],
-                "role_required": duty["role_required"], "teacher_id": teacher["id"],
+                "role_required": duty["role_required"], "year": duty.get("year", "ALL"), "department": duty.get("department", "General"), "teacher_id": teacher["id"],
                 "teacher_name": teacher["name"], "cost": int(cost) if cost >= 1 else cost
             })
 

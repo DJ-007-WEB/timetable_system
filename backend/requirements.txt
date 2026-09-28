@@ -9,3 +9,4 @@ scipy
 tabulate
 pdfplumber
 PyPDF2
+gunicorn

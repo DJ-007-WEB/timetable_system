@@ -1,7 +1,8 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, session
 from flask_cors import CORS
 import os
 import io
+import re
 from datetime import date, timedelta, datetime
 import pdfplumber
 from PyPDF2 import PdfReader
@@ -23,7 +24,8 @@ from db import (
     get_all_faculty_status,
     get_db,
     update_faculty_duty,
-    check_reset_fairness
+    check_reset_fairness,
+    set_teacher_eligibility
 )
 from flask import send_file
 import pandas as pd
@@ -38,20 +40,67 @@ app = Flask(
     __name__,
     static_folder=os.path.join("..", "frontend"),
 )
-CORS(app)
+ALLOWED_ORIGIN=os.getenv("FRONTEND_ORIGIN", "").strip()
+if ALLOWED_ORIGIN:
+    CORS(app, origins=[ALLOWED_ORIGIN], supports_credentials=True)
+app.secret_key=os.getenv("FLASK_SECRET_KEY") or os.urandom(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE=os.getenv("SESSION_COOKIE_SAMESITE","Lax"),SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE","0")=="1",MAX_CONTENT_LENGTH=int(os.getenv("MAX_UPLOAD_MB","10"))*1024*1024)
 
 UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 
+from functools import wraps
+def require_login(fn):
+    @wraps(fn)
+    def wrapper(*args,**kwargs):
+        if not session.get("authenticated"): return jsonify({"error":"Authentication required"}),401
+        return fn(*args,**kwargs)
+    return wrapper
+def require_admin(fn):
+    @wraps(fn)
+    def wrapper(*args,**kwargs):
+        if not session.get("authenticated"): return jsonify({"error":"Authentication required"}),401
+        if not session.get("is_admin"): return jsonify({"error":"Coordinator access required"}),403
+        return fn(*args,**kwargs)
+    return wrapper
+def current_teacher_id(): return session.get("teacher_id")
+
+def _csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = uuid.uuid4().hex
+        session["csrf_token"] = token
+    return token
+
+def require_csrf(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        expected = session.get("csrf_token")
+        supplied = request.headers.get("X-CSRF-Token", "")
+        if not expected or not supplied or not __import__('hmac').compare_digest(expected, supplied):
+            return jsonify({"error": "Invalid CSRF token"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+def safe_server_error(message="Internal server error"):
+    app.logger.exception(message)
+    return jsonify({"error": message}), 500
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc):
+    app.logger.exception("Unhandled application error")
+    return jsonify({"error": "Internal server error"}), 500
+
+# ================================================
+# ROUTES
 @app.route("/uploads/<filename>")
+@require_login
 def serve_upload(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
-# ================================================
-# ROUTES
 # ================================================
 
 @app.route("/")
@@ -61,6 +110,10 @@ def index():
 @app.route("/index.css")
 def css():
     return send_from_directory(app.static_folder, "index.css")
+
+@app.route("/csrf-token", methods=["GET"])
+def csrf_token():
+    return jsonify({"csrf_token": _csrf_token()})
 
 
 @app.route("/login", methods=["POST"])
@@ -102,11 +155,10 @@ def login():
             if not check_password_hash(stored_hash, password):
                 return jsonify({"error": "Invalid credentials"}), 401
         else:
-            # Legacy path: no password set yet → default password = teacher_id (e.g. "T1")
-            if password != teacher_id:
-                return jsonify({"error": "Invalid credentials"}), 401
+            return jsonify({"error":"Account password is not initialized. Ask the coordinator to run the user migration."}),403
 
         user_email = user.get("email", f"{teacher_id}@pict.edu")
+        session.clear(); session["authenticated"]=True; session["teacher_id"]=teacher_id; session["email"]=user_email; session["is_admin"]=bool(user.get("is_admin",False))
         return jsonify({
             "name"      : user.get("name"),
             "role"      : user.get("role"),
@@ -118,10 +170,11 @@ def login():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
         
 
 @app.route("/change_password", methods=["POST"])
+@require_csrf
 def change_password():
     data             = request.get_json()
     identifier       = (data.get("identifier", "") or "").strip()
@@ -130,10 +183,12 @@ def change_password():
 
     if not identifier or not current_password or not new_password:
         return jsonify({"error": "All fields are required"}), 400
-    if len(new_password) < 6:
-        return jsonify({"error": "New password must be at least 6 characters"}), 400
+    if len(new_password)<8 or not re.search(r"[A-Z]",new_password) or not re.search(r"[a-z]",new_password) or not re.search(r"\d",new_password) or not re.search(r"[^A-Za-z0-9]",new_password):
+        return jsonify({"error":"Password must be at least 8 characters and include upper, lower, digit and special character"}),400
 
     try:
+        if not session.get("authenticated"): return jsonify({"error":"Authentication required"}),401
+        if identifier not in {session.get("teacher_id"),session.get("email")} and not session.get("is_admin"): return jsonify({"error":"You can only change your own password"}),403
         from db import get_db, check_password_hash, update_password
         database = get_db()
 
@@ -151,9 +206,7 @@ def change_password():
             if not check_password_hash(stored_hash, current_password):
                 return jsonify({"error": "Current password is incorrect"}), 401
         else:
-            # Legacy default = teacher_id
-            if current_password != teacher_id:
-                return jsonify({"error": "Current password is incorrect"}), 401
+            return jsonify({"error":"Account password is not initialized. Ask the coordinator to run the user migration."}),403
 
         ok = update_password(identifier, new_password)
         if ok:
@@ -164,10 +217,54 @@ def change_password():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
+
+
+@app.route("/logout", methods=["POST"])
+@require_csrf
+def logout():
+    session.clear(); return jsonify({"success":True})
+
+@app.route("/health")
+def health():
+    try: get_db().command("ping"); return jsonify({"status":"ok","database":"ok"})
+    except Exception: return jsonify({"status":"degraded","database":"unavailable"}),503
+
+@app.route("/admin/teachers", methods=["GET", "PUT"])
+@require_login
+def admin_teachers():
+    if not session.get("is_admin"):
+        return jsonify({"error": "Coordinator access required"}), 403
+    try:
+        if request.method == "PUT":
+            expected = session.get("csrf_token")
+            supplied = request.headers.get("X-CSRF-Token", "")
+            if not expected or not supplied or not __import__('hmac').compare_digest(expected, supplied):
+                return jsonify({"error": "Invalid CSRF token"}), 403
+        database = get_db()
+        if request.method == "GET":
+            docs = []
+            for t in database["teachers"].find({}, {"_id": 0, "password_hash": 0}):
+                docs.append(t)
+            return jsonify({"teachers": docs})
+        data = request.get_json() or {}
+        teacher_id = str(data.get("teacher_id", "")).strip()
+        years = data.get("teaching_years", [])
+        department = data.get("department")
+        if not teacher_id:
+            return jsonify({"error": "teacher_id is required"}), 400
+        if not set_teacher_eligibility(teacher_id, years, department):
+            return jsonify({"error": "Teacher not found"}), 404
+        return jsonify({"success": True, "teacher_id": teacher_id, "teaching_years": years})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        return safe_server_error()
 
 
 @app.route("/generate", methods=["POST"])
+@require_csrf
+@require_admin
 def generate():
     """
     Main pipeline: Filter -> DSATUR -> Rooms -> Teachers
@@ -198,11 +295,13 @@ def generate():
         return jsonify({"error": "No file uploaded"}), 400
     
     file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "No file selected"}), 400
-
-    file_content = file.read()
-    temp_path = "temp_data.xlsx"
+    if file.filename == "": return jsonify({"error":"No file selected"}),400
+    if not file.filename.lower().endswith(".xlsx"):
+        return jsonify({"error":"Only .xlsx workbooks are accepted"}),400
+    if file.mimetype not in {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream"}:
+        return jsonify({"error":"Invalid workbook content type"}),400
+    file_content=file.read()
+    temp_path=os.path.join(app.config["UPLOAD_FOLDER"],f"generation_{uuid.uuid4().hex}.xlsx")
     with open(temp_path, "wb") as f:
         f.write(file_content)
 
@@ -231,7 +330,8 @@ def generate():
     try:
         student_courses, loaded_slots, course_meta, enrolled_counts = load_data(temp_path)
     except Exception as e:
-        return jsonify({"error": f"Error loading data: {str(e)}"}), 500
+        app.logger.exception("Error loading uploaded workbook")
+        return jsonify({"error": "Could not process the uploaded workbook"}), 500
 
     # Helper: normalize date strings to dd-Mon-YYYY (e.g., 26-Feb-2026)
     import pandas as _pd
@@ -437,10 +537,12 @@ def generate():
     # 2b. Adjust exam dates (move same-day exams to different days where possible)
     # -----------------------------------------------
     try:
-        from main import adjust_exam_dates
+        from main import adjust_exam_dates, validate_schedule
         adjust_exam_dates(final_data, student_courses, slot_meta)
+        violations=validate_schedule(final_data,student_courses)
+        if violations: return jsonify({"error":"Scheduling invariant violated after date adjustment","violations":violations[:25]}),422
     except Exception as adj_err:
-        print(f"adjust_exam_dates warning (non-fatal): {adj_err}")
+        return jsonify({"error":f"Scheduling post-processing failed: {adj_err}"}),500
 
     # -----------------------------------------------
     # 3. Run Stage 2 — Room Allocation
@@ -461,7 +563,8 @@ def generate():
             ]
         room_assignments, unallocated = allocate_rooms(final_data, rooms)
     except Exception as e:
-        return jsonify({"error": f"Error in room allocation: {str(e)}"}), 500
+        app.logger.exception("Room allocation failed")
+        return jsonify({"error": "Room allocation failed"}), 500
 
     # Build a mapping of assigned rooms for quick lookup: (course_id, slot, date) -> rooms_assigned
     room_map = {}
@@ -480,6 +583,8 @@ def generate():
     faculty_status = {}
     try:
         teachers = load_teacher_data(temp_path)
+        try: os.remove(temp_path)
+        except OSError: pass
         if branch_filter != "ALL":
             # Include teachers from the selected branch OR those marked as 'General' (cross-department)
             teachers = {
@@ -619,7 +724,8 @@ def generate():
         except Exception as adj_err:
             print(f"Adjustment apply warning: {adj_err}")
     except Exception as e:
-        return jsonify({"error": f"Error in teacher assignment: {str(e)}"}), 500
+        app.logger.exception("Teacher assignment failed")
+        return jsonify({"error": "Teacher assignment failed"}), 500
     # -----------------------
     # Sanitize outputs: convert numpy types to native Python types and ensure strings
     # -----------------------
@@ -707,6 +813,7 @@ def generate():
 
 
 @app.route("/export_excel", methods=["POST"])
+@require_admin
 def export_excel():
     """Accepts JSON with keys 'timetable', 'room_allocation', 'teacher_duties' and returns a styled xlsx."""
     data = request.get_json()
@@ -798,6 +905,8 @@ def export_excel():
 
 
 @app.route("/confirm", methods=["POST"])
+@require_csrf
+@require_admin
 def confirm():
     data = request.json or {}
     assignments = data.get("teacher_duties", []) or data.get("assignments", [])
@@ -808,8 +917,8 @@ def confirm():
         from db import get_db, update_faculty_duty, check_reset_fairness, format_date_to_standard
         database = get_db()
         
-        # Save confirmed timetable to db (overwriting previous confirmed timetables)
-        database["timetables"].delete_many({}) # keep only the latest confirmed one
+        latest=database["timetables"].find_one({"department":dept},sort=[("version",-1)])
+        next_version=int(latest.get("version",0))+1 if latest else 1
         
         # Handle both root fields payload (our style) or snapshot payload (remote style)
         timetable_val = data.get("timetable")
@@ -830,6 +939,7 @@ def confirm():
             "teacher_duties": duties_list,
             "summary": summary_val,
             "department": dept,
+            "version": next_version,
             "confirmed_at": datetime.utcnow().isoformat() + "Z"
         })
 
@@ -845,7 +955,7 @@ def confirm():
                 is_high_role=is_high,
                 course_id=a.get("course_id"),
                 room_assigned=a.get("room_assigned"),
-                session=a.get("session")
+                session=a.get("session"), year=a.get("year","ALL"), department=a.get("department","General")
             )
 
         # After adding new assignments, remove any previous/original duty history entries
@@ -890,32 +1000,74 @@ def confirm():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
 
 @app.route("/confirmed_timetable", methods=["GET"])
+@require_login
 def get_confirmed_timetable():
     from db import get_db
     try:
         database = get_db()
-        t = database["timetables"].find_one()
+        candidates = []
+
+        # Try primary collection first
+        candidates.extend(list(database["timetables"].find({"cleared":{"$ne":True}})))
+
+        # Fallbacks: try common alternative collection names, then search any collection
+        alt_names = ["timetable", "confirmed_timetable", "confirmed_timelines", "schedule"]
+        for name in alt_names:
+            if name in database.list_collection_names():
+                candidates.extend(list(database[name].find()))
+
+        if not candidates:
+            for coll in database.list_collection_names():
+                try:
+                    candidates.extend(list(database[coll].find({"$or": [{"teacher_duties": {"$exists": True}}, {"timetable": {"$exists": True}}]})))
+                except Exception:
+                    continue
+
+        t = select_best_timetable_doc(candidates)
         if t:
+            t = dict(t)
             t["_id"] = str(t["_id"])
             return jsonify(t)
         return jsonify(None)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
+
+@app.route("/timetable/versions")
+@require_admin
+def timetable_versions():
+    docs=list(get_db()["timetables"].find({}, {"_id":1,"department":1,"version":1,"confirmed_at":1,"summary":1}).sort([("department",1),("version",-1)]))
+    for d in docs: d["_id"]=str(d["_id"])
+    return jsonify(docs)
+
+@app.route("/timetable/rollback", methods=["POST"])
+@require_csrf
+@require_admin
+def timetable_rollback():
+    data=request.get_json() or {}; department=data.get("department","IT")
+    try: version=int(data.get("version"))
+    except: return jsonify({"error":"Version must be an integer"}),400
+    db=get_db(); src=db["timetables"].find_one({"department":department,"version":version})
+    if not src: return jsonify({"error":"Timetable version not found"}),404
+    latest=db["timetables"].find_one({"department":department},sort=[("version",-1)]); nv=int(latest.get("version",0))+1
+    clone={k:v for k,v in src.items() if k!="_id"}; clone.update({"version":nv,"rollback_of":version,"cleared":False,"confirmed_at":datetime.utcnow().isoformat()+"Z"}); db["timetables"].insert_one(clone)
+    return jsonify({"success":True,"version":nv,"rollback_of":version})
 
 @app.route("/clear_confirmed_timetable", methods=["POST"])
+@require_csrf
+@require_admin
 def clear_confirmed_timetable():
     from db import get_db
     try:
         database = get_db()
-        database["timetables"].delete_many({})
+        database["timetables"].update_many({"cleared":{"$ne":True}},{"$set":{"cleared":True,"cleared_at":datetime.utcnow().isoformat()+"Z"}})
         return jsonify({"success": True, "message": "Confirmed timetable cleared successfully."})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
 
 # ================================================
@@ -933,10 +1085,12 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route("/request_adjustment", methods=["POST"])
+@require_csrf
+@require_login
 def request_adjustment():
     from db import get_db, format_date_to_standard
     
-    teacher_id = request.form.get("teacher_id", "").strip()
+    teacher_id = session.get("teacher_id") or request.form.get("teacher_id", "").strip()
     current_date = format_date_to_standard(request.form.get("current_date", "").strip())
     current_slot = request.form.get("current_slot", "").strip()
     current_session = request.form.get("current_session", "").strip()
@@ -994,10 +1148,11 @@ def request_adjustment():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
 
 @app.route("/adjustments", methods=["GET"])
+@require_admin
 def get_adjustments():
     from db import get_db
     try:
@@ -1010,10 +1165,11 @@ def get_adjustments():
             
         return jsonify(adjustments)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
 
 @app.route("/adjustments/alternatives", methods=["GET"])
+@require_admin
 def get_alternatives():
     from db import get_db, format_date_to_standard
     request_id = request.args.get("request_id")
@@ -1145,10 +1301,12 @@ def get_alternatives():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
 
 @app.route("/approve_adjustment", methods=["POST"])
+@require_csrf
+@require_admin
 def approve_adjustment():
     from db import get_db, format_date_to_standard
     data = request.json or {}
@@ -1185,6 +1343,19 @@ def approve_adjustment():
             req_item = next((h for h in req_doc.get("history", []) if h.get("exam_date") == current_date and str(h.get("slot_id") or h.get("slot")) == str(current_slot)), {})
             partner_item = next((h for h in partner_doc.get("history", []) if h.get("exam_date") == new_date and str(h.get("slot_id") or h.get("slot")) == str(new_slot)), {})
             
+            if not req_item or not partner_item:
+                return jsonify({"error":"The requested duties could not be found in current faculty history"}),409
+            from main import normalize_year
+            def eligible_for_history(teacher,duty):
+                allowed=set(teacher.get("teaching_years",[]))
+                return "ALL" in allowed or normalize_year(duty.get("year","ALL")) in allowed
+            if req_item.get("role_assigned") != partner_item.get("role_assigned"):
+                return jsonify({"error":"Swap partners must have the same invigilation role"}),422
+            if not eligible_for_history(req_doc,partner_item):
+                return jsonify({"error":"Requester is not eligible for the target exam year"}),422
+            if not eligible_for_history(partner_doc,req_item):
+                return jsonify({"error":"Swap partner is not eligible for the target exam year"}),422
+
             # Swap histories in DB
             res1 = database["teachers"].update_one(
                 {"$or": [{"teacher_id": requester_id}, {"email": requester_id}], "history.exam_date": current_date, "history.slot_id": str(current_slot)},
@@ -1192,6 +1363,8 @@ def approve_adjustment():
                     "history.$.exam_date": new_date,
                     "history.$.slot_id": str(new_slot),
                     "history.$.course_id": partner_item.get("course_id", "ALL"),
+                    "history.$.year": partner_item.get("year", "ALL"),
+                    "history.$.department": partner_item.get("department", "General"),
                     "history.$.room_assigned": partner_item.get("room_assigned", "TBD"),
                     "history.$.session": partner_item.get("session", "TBD")
                 }}
@@ -1203,6 +1376,8 @@ def approve_adjustment():
                     "history.$.exam_date": current_date,
                     "history.$.slot_id": str(current_slot),
                     "history.$.course_id": req_item.get("course_id", "ALL"),
+                    "history.$.year": req_item.get("year", "ALL"),
+                    "history.$.department": req_item.get("department", "General"),
                     "history.$.room_assigned": req_item.get("room_assigned", "TBD"),
                     "history.$.session": req_item.get("session", "TBD")
                 }}
@@ -1226,12 +1401,27 @@ def approve_adjustment():
                 if target_room != "TBD":
                     break
                     
+            from main import normalize_year
+            req_doc = database["teachers"].find_one({"$or":[{"teacher_id":requester_id},{"email":requester_id}]})
+            if not req_doc:
+                return jsonify({"error":"Requester teacher not found"}),404
+            req_item = next((h for h in req_doc.get("history",[]) if h.get("exam_date")==current_date and str(h.get("slot_id") or h.get("slot"))==str(current_slot)),{})
+            if not req_item:
+                return jsonify({"error":"Current duty not found"}),409
+            target_item = next((h for t in all_teachers for h in t.get("history",[]) if h.get("exam_date")==new_date and str(h.get("slot_id") or h.get("slot"))==str(new_slot)),{})
+            target_year=normalize_year(target_item.get("year","ALL"))
+            allowed=set(req_doc.get("teaching_years",[]))
+            if "ALL" not in allowed and target_year not in allowed:
+                return jsonify({"error":"Teacher is not eligible for the target exam year"}),422
+
             res1 = database["teachers"].update_one(
                 {"$or": [{"teacher_id": requester_id}, {"email": requester_id}], "history.exam_date": current_date, "history.slot_id": str(current_slot)},
                 {"$set": {
                     "history.$.exam_date": new_date,
                     "history.$.slot_id": str(new_slot),
                     "history.$.course_id": target_course,
+                    "history.$.year": target_year,
+                    "history.$.department": target_item.get("department", "General"),
                     "history.$.room_assigned": target_room,
                     "history.$.session": target_session
                 }}
@@ -1254,10 +1444,12 @@ def approve_adjustment():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
 
 @app.route("/reject_adjustment", methods=["POST"])
+@require_csrf
+@require_admin
 def reject_adjustment():
     from db import get_db
     data = request.json or {}
@@ -1279,15 +1471,17 @@ def reject_adjustment():
         )
         return jsonify({"success": True, "message": "Adjustment request rejected."})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
 
 
 @app.route("/teacher/status", methods=["GET"])
+@require_login
 def get_teacher_status():
     from db import get_db
     identifier = request.args.get("identifier")
     if not identifier:
-        return jsonify({"error": "Missing identifier"}), 400
+        return jsonify({"error":"Missing identifier"}),400
+    if not session.get("is_admin") and identifier not in {session.get("teacher_id"),session.get("email")}: return jsonify({"error":"You can only view your own teacher status"}),403
     try:
         database = get_db()
         user = database["teachers"].find_one({
@@ -1308,7 +1502,167 @@ def get_teacher_status():
             "identifier": user_email
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return safe_server_error()
+def select_best_timetable_doc(candidates):
+    """Pick the most relevant published timetable document from a list of candidates."""
+    valid_candidates = [doc for doc in candidates if doc]
+    if not valid_candidates:
+        return None
+
+    def score(doc):
+        duties = doc.get("teacher_duties") or []
+        timetable_rows = doc.get("timetable") or []
+        duties_count = len(duties) if isinstance(duties, list) else 0
+        timetable_count = len(timetable_rows) if isinstance(timetable_rows, list) else 0
+        confirmed_at = doc.get("confirmed_at") or ""
+        return (1 if duties_count > 0 or timetable_count > 0 else 0, int(doc.get("version",0) or 0), duties_count, timetable_count, confirmed_at)
+
+    return max(valid_candidates, key=score)
+
+
+def build_all_teacher_duties_payload(timetable_doc, teachers):
+    """Build duties export payload from the latest confirmed timetable first, then fall back to teacher history."""
+    if not isinstance(timetable_doc, dict):
+        timetable_doc = {}
+
+    assignments = timetable_doc.get("teacher_duties", []) or []
+    if assignments:
+        teacher_lookup = {}
+        for teacher in teachers or []:
+            teacher_id = teacher.get("teacher_id") or teacher.get("email")
+            if teacher_id:
+                teacher_lookup[str(teacher_id)] = teacher
+            teacher_email = teacher.get("email")
+            if teacher_email:
+                teacher_lookup[str(teacher_email)] = teacher
+
+        duties = []
+        for assignment in assignments:
+            teacher_id = assignment.get("teacher_id") or assignment.get("teacherId") or assignment.get("teacher")
+            if not teacher_id:
+                continue
+
+            teacher_doc = teacher_lookup.get(str(teacher_id)) or teacher_lookup.get(teacher_id)
+            teacher_name = assignment.get("teacher_name") or assignment.get("teacher") or (teacher_doc.get("name") if teacher_doc else "Unknown")
+            role = assignment.get("role") or assignment.get("role_required") or (teacher_doc.get("last_role") if teacher_doc else "Junior")
+
+            duties.append({
+                "slot": assignment.get("slot") or assignment.get("slot_id"),
+                "date": assignment.get("date"),
+                "session": assignment.get("session", "TBD"),
+                "course_id": assignment.get("course_id", "ALL"),
+                "role": role,
+                "teacher_id": teacher_id,
+                "teacher_name": teacher_name,
+                "last_role": teacher_doc.get("last_role", "N/A") if teacher_doc else "N/A",
+                "is_priority": "Yes" if teacher_doc and not teacher_doc.get("has_served_high_role", True) else "No",
+                "room_assigned": assignment.get("room_assigned") or assignment.get("room") or "TBD"
+            })
+        return duties
+
+    active_dates = set()
+    for row in timetable_doc.get("timetable", []) or []:
+        d_val = row.get("date")
+        if d_val:
+            active_dates.add(str(d_val).strip())
+
+    for row in timetable_doc.get("teacher_duties", []) or []:
+        d_val = row.get("date")
+        if d_val:
+            active_dates.add(str(d_val).strip())
+
+    if not active_dates:
+        active_dates = None
+
+    duties = []
+    for teacher in teachers or []:
+        teacher_id = teacher.get("teacher_id") or teacher.get("email")
+        name = teacher.get("name", "Unknown")
+        last_role = teacher.get("last_role", "N/A")
+        is_priority = "Yes" if not teacher.get("has_served_high_role", True) else "No"
+
+        for h in teacher.get("history", []):
+            exam_date = h.get("exam_date")
+            if exam_date and (active_dates is None or str(exam_date).strip() in active_dates):
+                duties.append({
+                    "slot": h.get("slot_id") or h.get("slot"),
+                    "date": exam_date,
+                    "session": h.get("session", "TBD"),
+                    "course_id": h.get("course_id", "ALL"),
+                    "role": h.get("role_assigned") or h.get("role") or "Junior",
+                    "teacher_id": teacher_id,
+                    "teacher_name": name,
+                    "last_role": last_role,
+                    "is_priority": is_priority,
+                    "room_assigned": h.get("room_assigned") or h.get("room") or "TBD"
+                })
+    return duties
+
+
+@app.route("/api/timetable/duties", methods=["GET"])
+def get_all_teacher_duties():
+    from db import get_db
+    try:
+        database = get_db()
+        candidates = []
+
+        # Primary location: 'timetables' collection
+        candidates.extend(list(database["timetables"].find()))
+
+        # Fallbacks: try common alternative collection names
+        alt_names = ["timetable", "confirmed_timetable", "confirmed_timelines", "schedule"]
+        for name in alt_names:
+            if name in database.list_collection_names():
+                candidates.extend(list(database[name].find()))
+
+        # Last resort: scan collections for documents that look like a confirmed timetable
+        if not candidates:
+            for coll in database.list_collection_names():
+                try:
+                    candidates.extend(list(database[coll].find({"$or": [{"teacher_duties": {"$exists": True}}, {"timetable": {"$exists": True}}]})))
+                except Exception:
+                    continue
+
+        timetable_doc = select_best_timetable_doc(candidates)
+        if not timetable_doc:
+            return jsonify({"error": "No confirmed timetable found"}), 404
+
+        teachers = list(database["teachers"].find())
+        all_duties = build_all_teacher_duties_payload(timetable_doc, teachers)
+
+        return jsonify({"duties": all_duties})
+    except Exception as e:
+        return safe_server_error()
+
+
+@app.route("/api/teacher/duties", methods=["GET"])
+@require_login
+def get_teacher_duties():
+    """Return a teacher document and history for PDF generation (frontend expects this)."""
+    from db import get_db
+    teacher_id = request.args.get("teacher_id")
+    if not teacher_id:
+        return jsonify({"error":"Missing teacher_id"}),400
+    if not session.get("is_admin") and teacher_id not in {session.get("teacher_id"),session.get("email")}: return jsonify({"error":"You can only view your own duties"}),403
+    try:
+        database = get_db()
+        t = database["teachers"].find_one({"$or": [{"teacher_id": teacher_id}, {"email": teacher_id}]})
+        if not t:
+            return jsonify({"error": "Teacher not found"}), 404
+
+        # Normalize response shape expected by the frontend PDF generator
+        resp = {
+            "teacher_id": t.get("teacher_id") or t.get("email"),
+            "name": t.get("name", "Unknown"),
+            "last_role": t.get("last_role", "N/A"),
+            "has_served_high_role": t.get("has_served_high_role", True),
+            "history": t.get("history", [])
+        }
+        return jsonify(resp)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return safe_server_error()
 
 
 if __name__ == "__main__":

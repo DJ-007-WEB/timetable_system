@@ -16,6 +16,7 @@ import os
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash
+import re
 
 load_dotenv()
 
@@ -25,6 +26,9 @@ DB_NAME     = os.getenv("DB_NAME", "TimeTable")
 if not MONGODB_URI:
     print("ERROR: MONGODB_URI not set in .env")
     exit(1)
+MIGRATION_DEFAULT_PASSWORD=os.getenv("MIGRATION_DEFAULT_PASSWORD","")
+if len(MIGRATION_DEFAULT_PASSWORD)<8 or not re.search(r"[A-Z]",MIGRATION_DEFAULT_PASSWORD) or not re.search(r"[a-z]",MIGRATION_DEFAULT_PASSWORD) or not re.search(r"\d",MIGRATION_DEFAULT_PASSWORD) or not re.search(r"[^A-Za-z0-9]",MIGRATION_DEFAULT_PASSWORD):
+    print("ERROR: Set MIGRATION_DEFAULT_PASSWORD to a strong temporary password."); exit(1)
 
 client   = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
 database = client[DB_NAME]
@@ -57,8 +61,8 @@ for doc in col.find():
         email_changed = (new_email != email)
 
     # Decide the default password hash
-    new_hash      = generate_password_hash(teacher_id) if not has_hash else None
-    password_note = "(password already set)" if has_hash else f"(set default pw = '{teacher_id}')"
+    new_hash      = generate_password_hash(MIGRATION_DEFAULT_PASSWORD) if not has_hash else None
+    password_note = "(password already set)" if has_hash else "(set temporary migration password)"
 
     if not email_changed and has_hash:
         print(f"  SKIP   {doc.get('name', teacher_id)!r:<30} email={email!r}  {password_note}")
