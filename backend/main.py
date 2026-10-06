@@ -105,7 +105,14 @@ def normalize_year(value):
     return aliases.get(v, v)
 
 def validate_schedule(final_data, student_courses):
-    course_slot = {str(r.get("course_id")): (str(r.get("date", "")), str(r.get("slot", ""))) for r in final_data}
+    """Validate student clashes using the real exam date + session/time."""
+    course_slot = {
+        str(r.get("course_id")): (
+            str(r.get("date", "")),
+            str(r.get("session", "")).strip().casefold()
+        )
+        for r in final_data
+    }
     violations = []
     for student, courses in student_courses.items():
         seen = {}
@@ -114,30 +121,50 @@ def validate_schedule(final_data, student_courses):
             if key is None:
                 continue
             if key in seen:
-                violations.append(f"{student}: {course} and {seen[key]} on {key[0]} Slot {key[1]}")
+                violations.append(
+                    f"{student}: {course} and {seen[key]} on {key[0]} Session {key[1] or 'TBD'}"
+                )
             else:
                 seen[key] = course
     return violations
 
-def adjust_exam_dates(final_data, student_courses, slot_meta):
-    """Safely spread same-day exams; every accepted move is revalidated."""
+
+def adjust_exam_dates(final_data, student_courses, slot_meta, fixed_course_ids=None, max_iterations=None):
+    """Safely spread movable exams without cycling."""
+    fixed_course_ids = {str(v) for v in (fixed_course_ids or set())}
     candidates = []
+    seen_candidates = set()
     for key, meta in slot_meta.items():
-        if meta.get("date"):
-            candidates.append({
+        if meta.get("date") and meta.get("session"):
+            candidate = {
                 "slot": meta.get("display_id", key + 1),
                 "date": meta["date"],
                 "session": meta.get("session", "TBD")
-            })
-    candidates.sort(key=lambda x: (str(x["date"]), str(x["slot"])))
+            }
+            identity = (str(candidate["date"]), str(candidate["session"]).casefold(), str(candidate["slot"]))
+            if identity not in seen_candidates:
+                candidates.append(candidate)
+                seen_candidates.add(identity)
+    candidates.sort(key=lambda x: (str(x["date"]), str(x["session"]), str(x["slot"])))
+
     course_to_students = {}
     for student, courses in student_courses.items():
         for course in set(courses):
             course_to_students.setdefault(str(course), set()).add(str(student))
+
     row_by_course = {str(r["course_id"]): r for r in final_data}
     moved = []
-    changed = True
-    while changed:
+    initial_state = tuple(sorted(
+        (str(r["course_id"]), str(r.get("date", "")), str(r.get("session", "")), str(r.get("slot", "")))
+        for r in final_data
+    ))
+    visited_states = {initial_state}
+    if max_iterations is None:
+        max_iterations = max(1, len(final_data) * max(1, len(candidates)) * 2)
+
+    iterations = 0
+    while iterations < max_iterations:
+        iterations += 1
         changed = False
         for student, courses in student_courses.items():
             by_date = {}
@@ -148,33 +175,62 @@ def adjust_exam_dates(final_data, student_courses, slot_meta):
             duplicate = next((rows for rows in by_date.values() if len(rows) > 1), None)
             if not duplicate:
                 continue
-            row = duplicate[-1]
-            original = (str(row.get("date")), str(row.get("slot")))
-            ordered = sorted(candidates, key=lambda c: (str(c["date"]) == original[0], str(c["date"]), str(c["slot"])))
+
+            movable = [r for r in duplicate if str(r.get("course_id")) not in fixed_course_ids]
+            if not movable:
+                continue
+            row = movable[-1]
+            original = (str(row.get("date")), str(row.get("session", "")), str(row.get("slot")))
+            ordered = sorted(
+                candidates,
+                key=lambda c: (str(c["date"]) == original[0], str(c["date"]), str(c["session"]), str(c["slot"]))
+            )
+
             for cand in ordered:
-                target = (str(cand["date"]), str(cand["slot"]))
+                target = (str(cand["date"]), str(cand["session"]), str(cand["slot"]))
                 if target == original:
                     continue
                 conflict = False
                 for other in final_data:
-                    if other is row or (str(other.get("date")), str(other.get("slot"))) != target:
+                    if other is row:
+                        continue
+                    other_key = (
+                        str(other.get("date")),
+                        str(other.get("session", "")),
+                        str(other.get("slot"))
+                    )
+                    if other_key[:2] != target[:2]:
                         continue
                     if course_to_students.get(str(row["course_id"]), set()) & course_to_students.get(str(other["course_id"]), set()):
                         conflict = True
                         break
                 if conflict:
                     continue
+
                 old = dict(row)
                 row.update({"slot": cand["slot"], "date": cand["date"], "session": cand["session"]})
                 if validate_schedule(final_data, student_courses):
                     row.clear()
                     row.update(old)
                     continue
+
+                state = tuple(sorted(
+                    (str(r["course_id"]), str(r.get("date", "")), str(r.get("session", "")), str(r.get("slot", "")))
+                    for r in final_data
+                ))
+                if state in visited_states:
+                    row.clear()
+                    row.update(old)
+                    continue
+                visited_states.add(state)
                 moved.append({"course_id": row["course_id"], "from": original, "to": target})
                 changed = True
                 break
+
             if changed:
                 break
+        if not changed:
+            break
     return moved
 
 
@@ -356,7 +412,7 @@ def allocate_rooms(final_data, rooms):
         date = row.get("date")
         if students == 0:
             students = row.get("declared_students", 0)
-        slot_key = (date, slot)
+        slot_key = (date, str(row.get("session", "")).strip().casefold())
         used_in_slot = slot_used_rooms.setdefault(slot_key, set())
         available = [r for r in rooms if r["room_id"] not in used_in_slot]
         available.sort(key=lambda r: (r["capacity"], usage_counter[r["room_id"]]))
@@ -551,7 +607,7 @@ def build_duties(final_data, room_assignments=None):
     # Add Senior and Squad duties per unique (date, slot) pair
     seen_slots = set()
     for row in final_data:
-        slot_key = (row.get("date"), row.get("slot"))
+        slot_key = (row.get("date"), str(row.get("session", "")).strip().casefold())
         if slot_key not in seen_slots:
             for role in ["Senior", "Squad"]:
                 duties.append({
@@ -683,7 +739,7 @@ def assign_teachers(teachers, duties, fairness_map=None, db_duty_counts=None, MA
             duty = role_duties[c]
 
             # Collision check: same teacher, same slot & date
-            if any(a["teacher_id"] == teacher["id"] and a["slot"] == duty["slot"] and a.get("date") == duty.get("date") for a in assignments):
+            if any(a["teacher_id"] == teacher["id"] and a.get("date") == duty.get("date") and str(a.get("session", "")).strip().casefold() == str(duty.get("session", "")).strip().casefold() for a in assignments):
                 continue
 
             teacher_duty_count[teacher["id"]] += 1
@@ -704,7 +760,7 @@ def assign_teachers(teachers, duties, fairness_map=None, db_duty_counts=None, MA
             free_candidates = [
                 t for t in eligible_teachers
                 if teacher_can_invigilate(t, duty)
-                and not any(a["teacher_id"] == t["id"] and a["slot"] == duty["slot"] and a.get("date") == duty.get("date") for a in assignments)
+                and not any(a["teacher_id"] == t["id"] and a.get("date") == duty.get("date") and str(a.get("session", "")).strip().casefold() == str(duty.get("session", "")).strip().casefold() for a in assignments)
                 and (teacher_duty_count[t["id"]] + (sum(db_duty_counts.get(t["id"], {}).values()) if db_duty_counts else 0)) < MAX_DUTIES
             ]
             if free_candidates:
