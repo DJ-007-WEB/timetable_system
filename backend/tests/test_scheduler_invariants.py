@@ -42,6 +42,36 @@ class Tests(unittest.TestCase):
         adjust_exam_dates(rows, students, meta)
         self.assertEqual(validate_schedule(rows, students), [])
 
+    def test_session_is_real_conflict_key(self):
+        rows = [
+            {"course_id": "C1", "date": "01-Jul-2026", "slot": 1, "session": "Morning"},
+            {"course_id": "C2", "date": "01-Jul-2026", "slot": 2, "session": "Morning"},
+        ]
+        self.assertTrue(validate_schedule(rows, {"S1": ["C1", "C2"]}))
+
+    def test_fixed_course_is_never_moved(self):
+        rows = [
+            {"course_id": "C1", "date": "01-Jul-2026", "slot": 1, "session": "Morning"},
+            {"course_id": "C2", "date": "01-Jul-2026", "slot": 2, "session": "Afternoon"},
+        ]
+        students = {"S1": ["C1", "C2"]}
+        meta = {
+            0: {"display_id": 1, "date": "01-Jul-2026", "session": "Morning"},
+            1: {"display_id": 2, "date": "02-Jul-2026", "session": "Morning"},
+        }
+        adjust_exam_dates(rows, students, meta, fixed_course_ids={"C1"}, max_iterations=4)
+        self.assertEqual(rows[0]["date"], "01-Jul-2026")
+
+    def test_adjustment_is_bounded(self):
+        rows = [
+            {"course_id": "C1", "date": "01-Jul-2026", "slot": 1, "session": "Morning"},
+            {"course_id": "C2", "date": "01-Jul-2026", "slot": 2, "session": "Morning"},
+        ]
+        students = {"S1": ["C1", "C2"]}
+        meta = {0: {"display_id": 1, "date": "01-Jul-2026", "session": "Morning"}}
+        adjust_exam_dates(rows, students, meta, max_iterations=3)
+        self.assertEqual(rows[0]["date"], "01-Jul-2026")
+
     def test_year_rule(self):
         t = {"role": "Junior", "department": "IT", "teaching_years": {"FY"}}
         d = {"role_required": "Junior", "department": "IT", "year": "SY", "slot": 1}

@@ -4,6 +4,8 @@ import os
 import io
 import re
 import hmac
+import hashlib
+import json
 from datetime import date, timedelta, datetime
 import pdfplumber
 from PyPDF2 import PdfReader
@@ -165,7 +167,24 @@ def require_authentication():
 
 @app.route("/uploads/<filename>")
 def serve_upload(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    """Serve an adjustment document only to its owner or a coordinator."""
+    filename = os.path.basename(filename)
+    if not session.get("user_id"):
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        database = get_db()
+        adjustment = database["adjustments"].find_one({"file_path": filename})
+        if not adjustment:
+            return jsonify({"error": "File not found"}), 404
+        if not session.get("is_admin"):
+            owner = str(adjustment.get("teacher_id", "")).strip()
+            current_user = str(session.get("user_id", "")).strip()
+            current_email = str(session.get("identifier", "")).strip().lower()
+            if current_user != owner and current_email != owner.lower():
+                return jsonify({"error": "You are not authorized to view this file"}), 403
+        return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    except Exception:
+        return safe_server_error()
 
 
 # ================================================
@@ -312,7 +331,12 @@ def signup():
                 "error": "Coordinator accounts cannot be modified through faculty signup."
             }), 403
 
-        # Update existing faculty record
+        # Never overwrite an already initialized faculty password through public signup.
+        if user.get("password_hash"):
+            return jsonify({
+                "error": "An account for this faculty member already exists. Please sign in or contact the coordinator."
+            }), 409
+
         teachers.update_one(
             {"_id": user["_id"]},
             {"$set": {
@@ -696,10 +720,20 @@ def generate():
 
             color_to_global = {}
             L = len(frontend_slots)
+            if L == 0:
+                return jsonify({"error": f"No exam sessions are configured for {exam_date}."}), 422
+            if len(orig_colors) > L:
+                return jsonify({
+                    "error": (
+                        f"Too many conflicting exams are pinned to {exam_date}: "
+                        f"{len(orig_colors)} conflict groups require {len(orig_colors)} distinct sessions, "
+                        f"but only {L} sessions are configured. Add another session or change the pinned dates."
+                    )
+                }), 422
             for orig_color in orig_colors:
                 new_color = remap[orig_color]
                 color_to_global[orig_color] = global_slot_counter
-                session_val = frontend_slots[new_color % L] if L > 0 else None
+                session_val = frontend_slots[new_color]
                 slot_meta[global_slot_counter] = {
                     "display_id": new_color + 1,
                     "date": exam_date,
@@ -735,13 +769,22 @@ def generate():
         print(f"DEBUG: Pre-assigned final_data length: {len(final_data)}")
 
     # -----------------------------------------------
-    # 2b. Adjust exam dates (move same-day exams to different days where possible)
+    # 2b. Adjust dates only when dates are dynamically generated.
+    # Dates supplied by the Courses sheet are pinned constraints.
     # -----------------------------------------------
-    try:
-        from main import adjust_exam_dates
-        adjust_exam_dates(final_data, student_courses, slot_meta)
-    except Exception as adj_err:
-        print(f"adjust_exam_dates warning (non-fatal): {adj_err}")
+    if use_dynamic_dates:
+        try:
+            from main import adjust_exam_dates
+            adjust_exam_dates(final_data, student_courses, slot_meta)
+        except Exception as adj_err:
+            print(f"adjust_exam_dates warning (non-fatal): {adj_err}")
+    else:
+        pinned_violations = validate_schedule(final_data, student_courses)
+        if pinned_violations:
+            return jsonify({
+                "error": "Pinned exam dates cannot satisfy the student scheduling constraints.",
+                "violations": pinned_violations
+            }), 422
 
     # -----------------------------------------------
     # 3. Run Stage 2 — Room Allocation
@@ -1098,97 +1141,175 @@ def export_excel():
 @app.route("/confirm", methods=["POST"])
 @require_csrf
 def confirm():
+    """Publish only a complete, internally consistent timetable."""
     data = request.json or {}
     assignments = data.get("teacher_duties", []) or data.get("assignments", [])
-    dept = data.get("department", "IT")
-    timetable_data = data.get('timetable')
+    dept = str(data.get("department", "IT") or "IT").strip().upper()
+
+    if not isinstance(assignments, list) or not assignments:
+        return jsonify({"error": "Cannot publish: no faculty duties were supplied."}), 422
 
     try:
         from db import get_db, update_faculty_duty, check_reset_fairness, format_date_to_standard
-        database = get_db()
-        
-        # Publish as a new immutable timetable version instead of deleting prior history.
-        latest = database["timetables"].find_one({"department": dept}, sort=[("version", -1)])
-        next_version = int(latest.get("version", 0)) + 1 if latest else 1
+        from main import normalize_year, _department_matches
 
-        # Handle both root fields payload (our style) or snapshot payload (remote style)
+        database = get_db()
         timetable_val = data.get("timetable")
         if isinstance(timetable_val, dict):
             timetable_list = timetable_val.get("timetable", [])
             room_alloc = timetable_val.get("room_allocation", [])
-            duties_list = timetable_val.get("teacher_duties", [])
             summary_val = timetable_val.get("summary", {})
         else:
             timetable_list = data.get("timetable", [])
             room_alloc = data.get("room_allocation", [])
-            duties_list = assignments
             summary_val = data.get("summary", {})
 
+        if not isinstance(timetable_list, list) or not timetable_list:
+            return jsonify({"error": "Cannot publish: timetable is empty."}), 422
+        if not isinstance(room_alloc, list):
+            return jsonify({"error": "Cannot publish: room allocation is invalid."}), 422
+        if not isinstance(summary_val, dict):
+            summary_val = {}
+
+        if int(summary_val.get("rooms_failed", 0) or 0) > 0:
+            return jsonify({"error": "Cannot publish: one or more exams do not have complete room allocation."}), 422
+        if int(summary_val.get("duties_failed", 0) or 0) > 0:
+            return jsonify({"error": "Cannot publish: one or more invigilation duties are unassigned."}), 422
+
+        timetable_keys = set()
+        for row in timetable_list:
+            course_id = str(row.get("course_id", "")).strip()
+            date_val = format_date_to_standard(row.get("date"))
+            session_val = str(row.get("session", "")).strip().casefold()
+            if not course_id or not date_val or not session_val:
+                return jsonify({"error": "Cannot publish: timetable contains an incomplete exam row."}), 422
+            key = (course_id, date_val, session_val)
+            if key in timetable_keys:
+                return jsonify({"error": f"Cannot publish: duplicate exam session for course {course_id}."}), 422
+            timetable_keys.add(key)
+
+        room_keys = set()
+        for row in room_alloc:
+            status = str(row.get("status", "")).strip().lower()
+            rooms = str(row.get("rooms_assigned", "")).strip()
+            if status and status != "allocated":
+                return jsonify({"error": "Cannot publish: one or more exams do not have complete room allocation."}), 422
+            if not rooms or rooms.casefold() == "none":
+                return jsonify({"error": "Cannot publish: one or more exams do not have complete room allocation."}), 422
+            room_keys.add((
+                str(row.get("course_id", "")).strip(),
+                format_date_to_standard(row.get("date")),
+                str(row.get("session", "")).strip().casefold()
+            ))
+
+        for row in timetable_list:
+            key = (
+                str(row.get("course_id", "")).strip(),
+                format_date_to_standard(row.get("date")),
+                str(row.get("session", "")).strip().casefold()
+            )
+            if key not in room_keys:
+                return jsonify({"error": f"Cannot publish: missing room allocation for {row.get('course_id')}."}), 422
+
+        teachers = {}
+        for teacher in database["teachers"].find({"is_admin": {"$ne": True}}):
+            tid = str(teacher.get("teacher_id") or "").strip()
+            if tid:
+                teachers[tid] = teacher
+            email = str(teacher.get("email") or "").strip().lower()
+            if email:
+                teachers[email] = teacher
+
+        seen_teacher_sessions = set()
+        for duty in assignments:
+            teacher_id = str(duty.get("teacher_id", "")).strip()
+            teacher = teachers.get(teacher_id) or teachers.get(teacher_id.lower())
+            if not teacher:
+                return jsonify({"error": f"Cannot publish: teacher {teacher_id} does not exist."}), 422
+
+            role = str(duty.get("role") or duty.get("role_required") or "").strip()
+            if not role:
+                return jsonify({"error": "Cannot publish: a faculty duty has no role."}), 422
+            if str(teacher.get("role", "")).strip() != role:
+                return jsonify({"error": f"Cannot publish: teacher {teacher_id} is not a {role} invigilator."}), 422
+
+            date_val = format_date_to_standard(duty.get("date"))
+            session_val = str(duty.get("session", "")).strip().casefold()
+            if not date_val or not session_val:
+                return jsonify({"error": f"Cannot publish: duty for teacher {teacher_id} has no date/session."}), 422
+
+            collision_key = (teacher_id, date_val, session_val)
+            if collision_key in seen_teacher_sessions:
+                return jsonify({"error": f"Cannot publish: teacher {teacher_id} has simultaneous duties."}), 422
+            seen_teacher_sessions.add(collision_key)
+
+            duty_year = normalize_year(duty.get("year", "ALL"))
+            allowed_years = {normalize_year(v) for v in (teacher.get("teaching_years") or [])}
+            if allowed_years and "ALL" not in allowed_years and duty_year != "ALL" and duty_year not in allowed_years:
+                return jsonify({"error": f"Cannot publish: teacher {teacher_id} is not eligible for {duty_year}."}), 422
+
+            duty_department = duty.get("department", "General")
+            if not _department_matches(teacher.get("department"), duty_department):
+                return jsonify({"error": f"Cannot publish: teacher {teacher_id} is not eligible for {duty_department}."}), 422
+
+        canonical = {
+            "department": dept,
+            "timetable": timetable_list,
+            "room_allocation": room_alloc,
+            "teacher_duties": assignments,
+            "summary": summary_val,
+        }
+        payload_hash = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        latest = database["timetables"].find_one({"department": dept}, sort=[("version", -1)])
+        if latest:
+            latest_hash = latest.get("payload_hash")
+            if not latest_hash:
+                previous = {
+                    "department": dept,
+                    "timetable": latest.get("timetable", []),
+                    "room_allocation": latest.get("room_allocation", []),
+                    "teacher_duties": latest.get("teacher_duties", []),
+                    "summary": latest.get("summary", {}),
+                }
+                latest_hash = hashlib.sha256(
+                    json.dumps(previous, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+            if latest_hash == payload_hash and not latest.get("cleared", False):
+                return jsonify({"success": True, "idempotent": True, "version": latest.get("version", 1), "reset_triggered": False})
+
+        next_version = int(latest.get("version", 0)) + 1 if latest else 1
         database["timetables"].insert_one({
             "timetable": timetable_list,
             "room_allocation": room_alloc,
-            "teacher_duties": duties_list,
+            "teacher_duties": assignments,
             "summary": summary_val,
             "department": dept,
             "version": next_version,
+            "payload_hash": payload_hash,
             "cleared": False,
             "confirmed_at": datetime.utcnow().isoformat() + "Z"
         })
 
-        for a in assignments:
-            role_val = a.get("role") or a.get("role_required")
-            is_high = role_val in ["Senior", "Squad"]
-            date_val = format_date_to_standard(a.get("date"))
+        for duty in assignments:
+            role_val = duty.get("role") or duty.get("role_required")
             update_faculty_duty(
-                a["teacher_id"],
+                duty["teacher_id"],
                 role_val,
-                date_val,
-                a["slot"],
-                is_high_role=is_high,
-                course_id=a.get("course_id"),
-                room_assigned=a.get("room_assigned"),
-                session=a.get("session"), year=a.get("year", "ALL"), department=a.get("department", "General")
+                format_date_to_standard(duty.get("date")),
+                duty["slot"],
+                is_high_role=role_val in ["Senior", "Squad"],
+                course_id=duty.get("course_id"),
+                room_assigned=duty.get("room_assigned") or duty.get("room"),
+                session=duty.get("session"),
+                year=duty.get("year", "ALL"),
+                department=duty.get("department", "General")
             )
 
-        # After adding new assignments, remove any previous/original duty history entries
-        # for teachers affected by applied swaps so their 'My Duties' won't show obsolete entries.
-        try:
-            applied_adjs = list(database['adjustments'].find({"status": "applied"}))
-            for adj in applied_adjs:
-                for rec in adj.get('applied', []):
-                    s = rec.get('swap', {})
-                    applicant = s.get('applicant_id') or adj.get('applicant_id') or adj.get('identifier')
-                    adjusted = s.get('adjusted_id')
-                    old_date = format_date_to_standard(s.get('old_date') or s.get('swapped_duty_date'))
-                    new_date = format_date_to_standard(s.get('new_date') or s.get('next_duty_date'))
-
-                    # remove applicant's old duty (old_date) from their history
-                    if applicant:
-                        tdoc = database['teachers'].find_one({'$or': [{'teacher_id': applicant}, {'email': applicant}]})
-                        if tdoc:
-                            # find matching history entry
-                            hist = next((h for h in tdoc.get('history', []) if str(h.get('exam_date')) == str(old_date)), None)
-                            if hist:
-                                role_assigned = hist.get('role_assigned') or hist.get('role') or 'Junior'
-                                role_key = role_assigned.lower() if role_assigned.lower() in ['junior', 'senior', 'squad'] else 'junior'
-                                database['teachers'].update_one({'_id': tdoc['_id']}, {'$pull': {'history': {'exam_date': old_date}}})
-                                database['teachers'].update_one({'_id': tdoc['_id']}, {'$inc': {f'duty_counts.{role_key}': -1}})
-
-                    # remove adjusted teacher's old duty (new_date) from their history
-                    if adjusted:
-                        tdoc = database['teachers'].find_one({'$or': [{'teacher_id': adjusted}, {'email': adjusted}]})
-                        if tdoc:
-                            hist = next((h for h in tdoc.get('history', []) if str(h.get('exam_date')) == str(new_date)), None)
-                            if hist:
-                                role_assigned = hist.get('role_assigned') or hist.get('role') or 'Junior'
-                                role_key = role_assigned.lower() if role_assigned.lower() in ['junior', 'senior', 'squad'] else 'junior'
-                                database['teachers'].update_one({'_id': tdoc['_id']}, {'$pull': {'history': {'exam_date': new_date}}})
-                                database['teachers'].update_one({'_id': tdoc['_id']}, {'$inc': {f'duty_counts.{role_key}': -1}})
-        except Exception as adj_err:
-            print(f"Adjustment finalize warning: {adj_err}")
-
         reset_triggered = check_reset_fairness(department=dept)
-        return jsonify({"success": True, "reset_triggered": reset_triggered})
+        return jsonify({"success": True, "version": next_version, "reset_triggered": reset_triggered})
     except Exception:
         return safe_server_error()
 
@@ -1562,7 +1683,13 @@ def approve_adjustment():
                 }}
             )
             
-        else: # direct move
+        else:  # direct move
+            # A direct move can orphan the original exam duty. Require a peer
+            # swap for now unless the coordinator explicitly supplies a safe
+            # replacement through the swap flow.
+            return jsonify({
+                "error": "Direct moves are disabled because they can leave the original exam duty uncovered. Use 'Swap with Peer' instead."
+            }), 422
             req_doc = database["teachers"].find_one({"$or": [{"teacher_id": requester_id}, {"email": requester_id}]})
             if not req_doc:
                 return jsonify({"error": "Requester teacher not found"}), 404
