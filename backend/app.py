@@ -1684,54 +1684,93 @@ def approve_adjustment():
             )
             
         else:  # direct move
-            # A direct move can orphan the original exam duty. Require a peer
-            # swap for now unless the coordinator explicitly supplies a safe
-            # replacement through the swap flow.
-            return jsonify({
-                "error": "Direct moves are disabled because they can leave the original exam duty uncovered. Use 'Swap with Peer' instead."
-            }), 422
+            # A "move" is only safe when the occupied target duty can be
+            # exchanged with the requester. This preserves coverage at both
+            # the old and new sessions.
             req_doc = database["teachers"].find_one({"$or": [{"teacher_id": requester_id}, {"email": requester_id}]})
             if not req_doc:
                 return jsonify({"error": "Requester teacher not found"}), 404
-            # Try to look up another teacher's duty in the target slot to match the session/course/room details
-            target_course = "ALL"
-            target_room = "TBD"
-            target_session = "TBD"
-            target_year = "ALL"
-            target_department = "General"
-            
-            # Find a template duty scheduled in that target slot from other teachers' history
-            all_teachers = list(database["teachers"].find())
-            for t in all_teachers:
-                for h in t.get("history", []):
-                    if h.get("exam_date") == new_date and str(h.get("slot_id") or h.get("slot")) == str(new_slot):
-                        target_course = h.get("course_id", "ALL")
-                        target_room = h.get("room_assigned", "TBD")
-                        target_session = h.get("session", "TBD")
-                        target_year = h.get("year", "ALL")
-                        target_department = h.get("department", "General")
+
+            req_item = next(
+                (h for h in req_doc.get("history", [])
+                 if format_date_to_standard(h.get("exam_date")) == current_date
+                 and str(h.get("slot_id") or h.get("slot")) == str(current_slot)),
+                None
+            )
+            if not req_item:
+                return jsonify({"error": "Current duty could not be found"}), 409
+
+            target_teacher = None
+            target_item = None
+            for candidate in database["teachers"].find({"is_admin": {"$ne": True}}):
+                for history_item in candidate.get("history", []):
+                    if (format_date_to_standard(history_item.get("exam_date")) == new_date
+                            and str(history_item.get("slot_id") or history_item.get("slot")) == str(new_slot)):
+                        target_teacher = candidate
+                        target_item = history_item
                         break
-                if target_room != "TBD":
+                if target_teacher:
                     break
 
-            from main import normalize_year
-            allowed_years = {normalize_year(v) for v in req_doc.get("teaching_years", [])}
-            if target_year != "ALL" and "ALL" not in allowed_years and normalize_year(target_year) not in allowed_years:
-                return jsonify({"error": "Requester is not eligible for the target exam year"}), 422
-                    
+            if not target_teacher or not target_item:
+                return jsonify({
+                    "error": "The selected slot is not occupied by a faculty duty, so the original duty cannot be safely covered. Use a compatible peer swap."
+                }), 422
+
+            from main import normalize_year, _department_matches
+            req_role = str(req_item.get("role_assigned") or req_item.get("role") or "Junior")
+            target_role = str(target_item.get("role_assigned") or target_item.get("role") or "Junior")
+            if req_role != target_role:
+                return jsonify({"error": "The target duty must have the same invigilation role."}), 422
+
+            def _eligible_for_duty(teacher, duty):
+                allowed = {normalize_year(v) for v in (teacher.get("teaching_years") or [])}
+                year = normalize_year(duty.get("year", "ALL"))
+                if allowed and "ALL" not in allowed and year != "ALL" and year not in allowed:
+                    return False
+                return _department_matches(teacher.get("department"), duty.get("department", "General"))
+
+            if not _eligible_for_duty(req_doc, target_item) or not _eligible_for_duty(target_teacher, req_item):
+                return jsonify({"error": "This move would violate teacher eligibility."}), 422
+
+            target_teacher_id = target_teacher.get("teacher_id") or target_teacher.get("email")
+            if not target_teacher_id or str(target_teacher_id) == str(requester_id):
+                return jsonify({"error": "No compatible replacement duty is available."}), 422
+
             res1 = database["teachers"].update_one(
-                {"$or": [{"teacher_id": requester_id}, {"email": requester_id}], "history.exam_date": current_date, "history.slot_id": str(current_slot)},
+                {"_id": req_doc["_id"], "history.exam_date": current_date, "history.slot_id": str(current_slot)},
                 {"$set": {
                     "history.$.exam_date": new_date,
                     "history.$.slot_id": str(new_slot),
-                    "history.$.course_id": target_course,
-                    "history.$.year": target_year,
-                    "history.$.department": target_department,
-                    "history.$.room_assigned": target_room,
-                    "history.$.session": target_session
+                    "history.$.course_id": target_item.get("course_id", "ALL"),
+                    "history.$.year": target_item.get("year", "ALL"),
+                    "history.$.department": target_item.get("department", "General"),
+                    "history.$.room_assigned": target_item.get("room_assigned", "TBD"),
+                    "history.$.session": target_item.get("session", "TBD")
                 }}
             )
-                
+            res2 = database["teachers"].update_one(
+                {"_id": target_teacher["_id"], "history.exam_date": new_date, "history.slot_id": str(new_slot)},
+                {"$set": {
+                    "history.$.exam_date": current_date,
+                    "history.$.slot_id": str(current_slot),
+                    "history.$.course_id": req_item.get("course_id", "ALL"),
+                    "history.$.year": req_item.get("year", "ALL"),
+                    "history.$.department": req_item.get("department", "General"),
+                    "history.$.room_assigned": req_item.get("room_assigned", "TBD"),
+                    "history.$.session": req_item.get("session", "TBD")
+                }}
+            )
+            if res1.matched_count == 0 or res2.matched_count == 0:
+                return jsonify({"error": "Duty swap could not be completed safely."}), 409
+
+            # The database sync uses the same swap semantics for the confirmed
+            # timetable, so exports/views remain covered at both sessions.
+            action_type = "swap"
+            swap_teacher_id = str(target_teacher_id)
+            target_course = target_item.get("course_id", "ALL")
+            target_room = target_item.get("room_assigned", "TBD")
+            target_session = target_item.get("session", "TBD")
         # Update request status in database
         database["adjustments"].update_one(
             {"_id": ObjectId(request_id)},
